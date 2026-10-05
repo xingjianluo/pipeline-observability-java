@@ -19,12 +19,22 @@ public class ApiExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(ApiExceptionHandler.class);
 
+    private final ObservabilityController controller;
+
+    public ApiExceptionHandler(ObservabilityController controller) {
+        this.controller = controller;
+    }
+
+    /**
+     * 畸形 JSON：整条报文结构不合法，归 MALFORMED_PAYLOAD（区别于某个字段类型不对的 TYPE_MISMATCH）。
+     * 同样留痕、计数，不静默丢弃。
+     */
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<IngestResult> unreadable(HttpMessageNotReadableException e) {
         log.warn("malformed json body: {}", e.getMessage());
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(IngestResult.rejected(RejectCode.TYPE_MISMATCH,
-                        "malformed or non-JSON request body: " + e.getMostSpecificCause().getMessage()));
+        IngestResult result = controller.reportMalformed("malformed or non-JSON request body: "
+                + e.getMostSpecificCause().getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(result);
     }
 
     @ExceptionHandler(IllegalArgumentException.class)

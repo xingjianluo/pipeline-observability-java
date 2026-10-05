@@ -69,7 +69,9 @@ class WebApiIntegrationTest {
         String resp = rest.postForObject(url("/api/observability/events"),
                 new HttpEntity<>("{not-json", headers), String.class);
         log.info("[MALFORMED RESP] {}", resp);
-        assertTrue(resp.contains("TYPE_MISMATCH"), "malformed body must carry reject code");
+        // 整条报文结构不合法：归 MALFORMED_PAYLOAD（与字段类型不对的 TYPE_MISMATCH 明确区分）。
+        assertTrue(resp.contains("MALFORMED_PAYLOAD"), "malformed body must carry MALFORMED_PAYLOAD code");
+        assertFalse(resp.contains("TYPE_MISMATCH"), "malformed payload must not be reported as TYPE_MISMATCH");
     }
 
     @Test
@@ -83,5 +85,52 @@ class WebApiIntegrationTest {
         log.info("[BAD PROTOCOL RESP] {}", resp);
         assertTrue(resp.contains("UNSUPPORTED_PROTOCOL_VERSION"));
         assertFalse(resp.contains("\"accepted\":true"));
+    }
+
+    @Test
+    void rejectionLedgerAndStatsAreQueryableViaHttp() throws Exception {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        // 产生一条可识别管道的拒绝
+        String body = "{\"protocolVersion\":\"2.0\",\"runId\":\"rj\",\"pipelineName\":\"web-rj\","
+                + "\"status\":\"RUNNING\",\"eventTime\":1700000000000}";
+        rest.postForObject(url("/api/observability/events"),
+                new HttpEntity<>(body, headers), String.class);
+
+        String stats = rest.getForObject(
+                url("/api/observability/rejections/stats?pipeline=web-rj"), String.class);
+        log.info("[REJECT STATS HTTP] {}", stats);
+        assertTrue(stats.contains("UNSUPPORTED_PROTOCOL_VERSION"));
+        assertTrue(stats.matches("(?s).*\"total\"\\s*:\\s*1.*"), "total rejected should be 1: " + stats);
+
+        String list = rest.getForObject(
+                url("/api/observability/rejections?pipeline=web-rj&reason=UNSUPPORTED_PROTOCOL_VERSION"),
+                String.class);
+        log.info("[REJECT LIST HTTP] {}", list);
+        assertTrue(list.startsWith("["));
+        assertTrue(list.contains("web-rj"));
+        assertTrue(list.contains("rawPayload"));
+    }
+
+    @Test
+    void reconciliationReportIsConsistentViaHttp() throws Exception {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        String body = "{\"protocolVersion\":\"1.1\",\"runId\":\"web-rc\",\"pipelineName\":\"web-rc\","
+                + "\"status\":\"SUCCESS\",\"eventTime\":" + ClockTestConfig.T0 + "}";
+        rest.postForObject(url("/api/observability/events"),
+                new HttpEntity<>(body, headers), String.class);
+
+        String resp = rest.getForObject(
+                url("/api/observability/reconciliation/web-rc"), String.class);
+        log.info("[RECONCILIATION HTTP] {}", resp);
+        JsonNode node = mapper.readTree(resp);
+        assertEquals("HEALTHY", node.get("healthStatus").asText());
+        assertTrue(node.get("consistent").asBoolean());
+        assertEquals(0, node.get("activeAlerts").size());
+        assertTrue(node.get("metrics").get("received").asInt() >= 1);
+
+        String all = rest.getForObject(url("/api/observability/reconciliation"), String.class);
+        assertTrue(mapper.readTree(all).isArray());
     }
 }

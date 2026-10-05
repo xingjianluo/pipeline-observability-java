@@ -47,8 +47,13 @@ public class DefaultAlertService implements AlertService {
     @Override
     public Alert reconcile(HealthAssessment assessment, long atMillis) {
         AlertType type = map(assessment.getStatus());
-        log.info("reconcile pipeline={} verdict={} alertType={} at={}",
-                assessment.getPipelineName(), assessment.getStatus(), type, atMillis);
+        // 连续错过多轮调度：结论随轮次加重，1 轮 WARNING，>=2 轮直接 CRITICAL。
+        AlertSeverity desired = assessment.getStatus() == FreshnessStatus.SCHEDULE_LAGGING
+                && assessment.getMissedRounds() >= 2
+                ? AlertSeverity.CRITICAL : AlertSeverity.WARNING;
+        log.info("reconcile pipeline={} verdict={} alertType={} missed={} severity={} at={}",
+                assessment.getPipelineName(), assessment.getStatus(), type,
+                assessment.getMissedRounds(), desired, atMillis);
         if (type == null) {
             // 健康/抖动/从未成功：确保该管道所有健康类与失败类活跃告警被幂等恢复。
             if (assessment.getStatus() == FreshnessStatus.HEALTHY) {
@@ -60,7 +65,8 @@ public class DefaultAlertService implements AlertService {
             return null;
         }
         return merge(assessment.getPipelineName(), type, atMillis,
-                assessment.getStatus().name() + ": " + String.join("; ", assessment.getReasons()));
+                assessment.getStatus().name() + ": " + String.join("; ", assessment.getReasons()),
+                desired);
     }
 
     private static AlertType map(FreshnessStatus s) {
@@ -75,19 +81,47 @@ public class DefaultAlertService implements AlertService {
     @Override
     public Alert reportFailure(String pipelineName, String runId, long atMillis, String detail) {
         return merge(pipelineName, AlertType.RUN_FAILED, atMillis,
-                "runId=" + runId + " " + detail);
+                "runId=" + runId + " " + detail, AlertSeverity.WARNING);
+    }
+
+    @Override
+    public long mergedCountForPipeline(String pipelineName) {
+        return active.values().stream()
+                .filter(a -> a.getPipelineName().equals(pipelineName))
+                .mapToLong(Alert::getCount).sum();
+    }
+
+    @Override
+    public long suppressedCountForPipeline(String pipelineName) {
+        return active.values().stream()
+                .filter(a -> a.getPipelineName().equals(pipelineName))
+                .mapToLong(Alert::getSuppressedCount).sum();
+    }
+
+    @Override
+    public long notifiedCountForPipeline(String pipelineName) {
+        return active.values().stream()
+                .filter(a -> a.getPipelineName().equals(pipelineName))
+                .mapToLong(Alert::getNotifiedCount).sum();
     }
 
     /**
      * 原子合并：ConcurrentMap.compute 对同一 key 串行，并发上报计数绝不丢失。
      * 迟到（atMillis 早于已处理时间）的观测直接忽略，不回退结论。
+     *
+     * @param desiredSeverity 本次观测期望的级别（如连续错过 2 轮为 CRITICAL）；
+     *                        只升不降，避免抖动导致级别回退。
      */
-    private Alert merge(String pipeline, AlertType type, long atMillis, String detail) {
+    private Alert merge(String pipeline, AlertType type, long atMillis, String detail,
+                        AlertSeverity desiredSeverity) {
         boolean suppressedNow = maintenanceService.isSuppressed(pipeline, atMillis);
         Alert result = active.compute(key(pipeline, type), (k, cur) -> {
             if (cur == null) {
                 Alert a = newAlert(pipeline, type, atMillis, detail);
                 a.setCount(1);
+                if (desiredSeverity == AlertSeverity.CRITICAL) {
+                    a.setSeverity(AlertSeverity.CRITICAL);
+                }
                 if (suppressedNow) {
                     a.setState(AlertState.SUPPRESSED);
                     a.setSuppressedCount(1);
@@ -96,8 +130,8 @@ public class DefaultAlertService implements AlertService {
                     a.setNotifiedCount(a.getNotifiedCount() + 1);
                     sink.notifyFiring(copyOf(a));
                 }
-                log.info("alert triggered pipeline={} type={} suppressed={} at={}",
-                        pipeline, type, suppressedNow, atMillis);
+                log.info("alert triggered pipeline={} type={} suppressed={} severity={} at={}",
+                        pipeline, type, suppressedNow, a.getSeverity(), atMillis);
                 return a;
             }
             // 迟到观测保护：不允许旧观测改动新状态或重复通知。
@@ -109,6 +143,13 @@ public class DefaultAlertService implements AlertService {
             cur.setCount(cur.getCount() + 1);
             cur.setLastTriggeredAt(atMillis);
             cur.setDetail(detail);
+            // 观测结论加重（错过更多轮次）时升级级别，只升不降。
+            if (desiredSeverity == AlertSeverity.CRITICAL
+                    && cur.getSeverity() != AlertSeverity.CRITICAL) {
+                cur.setSeverity(AlertSeverity.CRITICAL);
+                cur.setEscalatedCount(cur.getEscalatedCount() + 1);
+                log.info("alert upgraded by severity pipeline={} type={} -> CRITICAL", pipeline, type);
+            }
 
             if (suppressedNow) {
                 // 维护窗口内：合并计数但抑制一切通知；从 FIRING 转入 SUPPRESSED。

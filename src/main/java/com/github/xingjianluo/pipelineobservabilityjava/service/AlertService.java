@@ -19,4 +19,13 @@ public interface AlertService {
     Alert recover(String pipelineName, AlertType type, long atMillis);
 
     List<Alert> list(boolean includeRecovered);
+
+    /** 该管道当前所有活跃告警的合并观测次数之和（告警合并计数）。 */
+    long mergedCountForPipeline(String pipelineName);
+
+    /** 该管道当前活跃告警在维护窗口内被抑制的合并次数之和。 */
+    long suppressedCountForPipeline(String pipelineName);
+
+    /** 该管道当前活跃告警已对外发送的通知次数之和。 */
+    long notifiedCountForPipeline(String pipelineName);
 }

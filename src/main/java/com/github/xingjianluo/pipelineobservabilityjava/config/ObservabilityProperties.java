@@ -78,6 +78,17 @@ public class ObservabilityProperties {
         return resolved;
     }
 
+    /**
+     * 该管道是否被显式配置过调度（管道级覆盖中出现任意调度相关键）。
+     * 用于区分“按周期调度的管道”与“只看新鲜度的管道”，避免给后者强套周期告警。
+     */
+    public boolean isScheduleAware(String pipelineName) {
+        Thresholds override = pipelineName == null ? null : pipelines.get(pipelineName);
+        return override != null
+                && (override.getScheduleIntervalMs() != null
+                || override.getScheduleGraceMs() != null);
+    }
+
     public java.util.List<String> getSupportedProtocolVersions() { return supportedProtocolVersions; }
     public void setSupportedProtocolVersions(java.util.List<String> supportedProtocolVersions) { this.supportedProtocolVersions = supportedProtocolVersions; }
     public long getDefaultFreshnessThresholdMs() { return defaultFreshnessThresholdMs; }

@@ -10,8 +10,12 @@ import com.github.xingjianluo.pipelineobservabilityjava.model.IngestResult;
 import com.github.xingjianluo.pipelineobservabilityjava.model.PipelineEvent;
 import com.github.xingjianluo.pipelineobservabilityjava.model.PipelineRunState;
 import com.github.xingjianluo.pipelineobservabilityjava.model.RejectCode;
+import com.github.xingjianluo.pipelineobservabilityjava.model.RejectedEvent;
 import com.github.xingjianluo.pipelineobservabilityjava.model.RunStatus;
+import com.github.xingjianluo.pipelineobservabilityjava.store.PipelineMetricsRegistry;
+import com.github.xingjianluo.pipelineobservabilityjava.store.RejectionLedger;
 import com.github.xingjianluo.pipelineobservabilityjava.store.RunStateStore;
+import com.github.xingjianluo.pipelineobservabilityjava.time.SystemClock;
 
 @Service
 public class DefaultEventIngestionService implements EventIngestionService {
@@ -22,28 +26,55 @@ public class DefaultEventIngestionService implements EventIngestionService {
     private final ObservabilityProperties properties;
     private final AlertService alertService;
     private final HealthEvaluationService healthEvaluationService;
+    private final RejectionLedger rejectionLedger;
+    private final PipelineMetricsRegistry metricsRegistry;
+    private final SystemClock clock;
 
     public DefaultEventIngestionService(RunStateStore store,
                                         ObservabilityProperties properties,
                                         AlertService alertService,
-                                        HealthEvaluationService healthEvaluationService) {
+                                        HealthEvaluationService healthEvaluationService,
+                                        RejectionLedger rejectionLedger,
+                                        PipelineMetricsRegistry metricsRegistry,
+                                        SystemClock clock) {
         this.store = store;
         this.properties = properties;
         this.alertService = alertService;
         this.healthEvaluationService = healthEvaluationService;
+        this.rejectionLedger = rejectionLedger;
+        this.metricsRegistry = metricsRegistry;
+        this.clock = clock;
     }
 
     @Override
     public IngestResult ingest(JsonNode raw) {
+        return ingest(raw, null, null);
+    }
+
+    /**
+     * @param rawPayload 原始报文字符串（畸形 JSON 无法解析成 JsonNode 时由 Web 层传入，供留痕自查）；
+     *                   为 null 时留痕中用 raw 节点的文本形式。
+     */
+    public IngestResult ingest(JsonNode raw, String rawPayload, RejectCode preclassified) {
         log.info("ingest event raw={}", raw);
         // 1) 解析 + 严格校验：任何不合规都返回带明确原因的拒绝，绝不静默丢弃。
         PipelineEvent event;
         try {
-            event = parse(raw);
+            event = parse(raw, preclassified);
         } catch (EventRejectedException e) {
-            log.warn("event rejected code={} reason={} raw={}", e.getCode(), e.getMessage(), raw);
+            String pipelineName = extractPipelineName(raw);
+            // 每条被拒上报：留痕（带原始报文）+ 精确计数，可按管道/原因自查。
+            recordRejection(pipelineName, extractRunId(raw), e.getCode(), e.getMessage(),
+                    rawPayload != null ? rawPayload : String.valueOf(raw));
+            metricsRegistry.incrementReceived(pipelineName);
+            metricsRegistry.incrementRejected(pipelineName);
+            log.warn("event rejected code={} pipeline={} reason={} raw={}",
+                    e.getCode(), pipelineName, e.getMessage(), raw);
             return IngestResult.rejected(e.getCode(), e.getMessage());
         }
+
+        // 收到一条可识别管道的上报：先计 received（接受/重复/迟到都恰好计一次）。
+        metricsRegistry.incrementReceived(event.getPipelineName());
 
         // 2) 在按 runId 串行化的临界区内完成状态机收敛，保证乱序/并发结论一致。
         final PipelineEvent ev = event;
@@ -58,24 +89,68 @@ public class DefaultEventIngestionService implements EventIngestionService {
         if (outcome.duplicate) {
             r.setDuplicate(true);
             r.setMessage("duplicate event merged, no state change: " + outcome.reason);
+            metricsRegistry.incrementDuplicate(ev.getPipelineName());
         } else if (outcome.lateIgnored) {
             r.setDuplicate(false);
             r.setMessage("late event ignored, terminal/later state preserved: " + outcome.reason);
+            metricsRegistry.incrementLate(ev.getPipelineName());
         } else {
             r.setMessage("applied as " + state.getStatus());
+            // 只有真正推进状态的事件计 accepted，重复/迟到都不算。
+            metricsRegistry.incrementAccepted(ev.getPipelineName());
         }
-        log.info("converged runId={} status={} version={} duplicate={} reason={}",
-                ev.getRunId(), state.getStatus(), state.getVersion(), outcome.duplicate, outcome.reason);
+        log.info("converged runId={} status={} version={} duplicate={} late={} reason={}",
+                ev.getRunId(), state.getStatus(), state.getVersion(), outcome.duplicate,
+                outcome.lateIgnored, outcome.reason);
         if (!outcome.duplicate && !outcome.lateIgnored) {
-            // 事件真正推进状态后，按当前时钟联动一次健康判定与告警对账（SLA/新鲜度告警随之收敛）。
-            long now = System.currentTimeMillis();
+            // 事件真正推进状态后联动一次健康判定与告警对账。
+            // 评估时刻取“当前时钟”与“本事件时间”的较大者：业务时钟乱序到达时不会让一次旧观测
+            // 把告警对账往回拨（与告警侧迟到保护一致），正常推进时即按当前时钟收敛。
+            long now = Math.max(clock.nowMillis(), ev.getEventTime());
             healthEvaluationService.assessAndReconcile(ev.getPipelineName(), now);
         }
         return r;
     }
 
+    private void recordRejection(String pipelineName, String runId, RejectCode code,
+                                 String reason, String rawPayload) {
+        RejectedEvent re = new RejectedEvent();
+        re.setRejectedAt(clock.nowMillis());
+        re.setPipelineName(pipelineName);
+        re.setRunId(runId);
+        re.setRejectCode(code);
+        re.setReason(reason);
+        re.setRawPayload(rawPayload);
+        rejectionLedger.record(re);
+    }
+
+    /** 在拒绝路径上尽力提取 pipelineName，提取不到（如畸形/非对象）归 null，计数进 unknown 桶。 */
+    private static String extractPipelineName(JsonNode raw) {
+        try {
+            JsonNode n = raw == null ? null : raw.get("pipelineName");
+            if (n != null && n.isTextual() && !n.asText().isBlank()) {
+                return n.asText();
+            }
+        } catch (Exception ignore) {
+            // 畸形节点不可读时保持 null。
+        }
+        return null;
+    }
+
+    private static String extractRunId(JsonNode raw) {
+        try {
+            JsonNode n = raw == null ? null : raw.get("runId");
+            if (n != null && n.isTextual()) {
+                return n.asText();
+            }
+        } catch (Exception ignore) {
+            // 保持 null
+        }
+        return null;
+    }
+
     private PipelineRunState converge(PipelineRunState s, PipelineEvent ev, ConvergenceOutcome out) {
-        long ingestAt = System.currentTimeMillis();
+        long ingestAt = clock.nowMillis();
         if (s.getStatus() == null) {
             s.setFirstSeenTime(ingestAt);
         }
@@ -146,16 +221,17 @@ public class DefaultEventIngestionService implements EventIngestionService {
         s.getTransitionLog().add(ingestAt + " APPLY " + old + "->" + s.getStatus()
                 + " eventTime=" + ev.getEventTime() + " key=" + dedupeKey);
 
-        // 终结结论切换时联动失败告警（同状态重复的终结覆盖不会重复发通知，告警侧按 key 合并）。
+        // 终结结论切换时联动失败告警。告警时刻用事件本身的 eventTime（业务时钟），
+        // 这样乱序/并发或固定测试时钟下都满足“旧时刻不能覆盖新状态”的迟到保护。
         if (next == RunStatus.FAILED) {
-            alertService.reportFailure(s.getPipelineName(), s.getRunId(), ingestAt,
+            alertService.reportFailure(s.getPipelineName(), s.getRunId(), ev.getEventTime(),
                     "run failed at eventTime=" + ev.getEventTime());
         }
         if (next == RunStatus.SUCCESS && old != RunStatus.SUCCESS) {
             // 失败后更晚的成功到达：立即关闭失败告警，保证“刚刚恢复不残留”。
             alertService.recover(s.getPipelineName(),
                     com.github.xingjianluo.pipelineobservabilityjava.model.AlertType.RUN_FAILED,
-                    ingestAt);
+                    ev.getEventTime());
         }
         return s;
     }
@@ -168,9 +244,15 @@ public class DefaultEventIngestionService implements EventIngestionService {
         };
     }
 
-    private PipelineEvent parse(JsonNode raw) {
+    private PipelineEvent parse(JsonNode raw, RejectCode preclassified) {
+        if (preclassified == RejectCode.MALFORMED_PAYLOAD) {
+            // 整条报文无法解析（畸形 JSON / 非 JSON 对象）：与“字段类型不对”明确区分。
+            throw new EventRejectedException(RejectCode.MALFORMED_PAYLOAD,
+                    "malformed or non-JSON request body");
+        }
         if (raw == null || !raw.isObject()) {
-            throw new EventRejectedException(RejectCode.MISSING_FIELD, "request body must be a JSON object");
+            throw new EventRejectedException(RejectCode.MALFORMED_PAYLOAD,
+                    "request body must be a JSON object");
         }
         PipelineEvent ev = new PipelineEvent();
 

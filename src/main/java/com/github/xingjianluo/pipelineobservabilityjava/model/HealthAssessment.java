@@ -16,6 +16,14 @@ public final class HealthAssessment {
     private Long expectedScheduleMs;
     private Long observedLagMs;
     private Long runningDurationMs;
+    /** 该管道生效的调度周期与宽限（毫秒）。 */
+    private long scheduleIntervalMs;
+    private long scheduleGraceMs;
+    /** 推算出的“下一轮本该什么时候跑”的锚点（上一轮基准）与最近到期轮次时刻。 */
+    private Long scheduleAnchorMs;
+    private Long nextExpectedRunMs;
+    /** 已错过的调度轮次：0=正常/还没到点（含宽限），>=1=错过一轮或连续多轮。 */
+    private int missedRounds;
     private final List<String> reasons = new ArrayList<>();
 
     public HealthAssessment() {
@@ -43,5 +51,15 @@ public final class HealthAssessment {
     public void setObservedLagMs(Long observedLagMs) { this.observedLagMs = observedLagMs; }
     public Long getRunningDurationMs() { return runningDurationMs; }
     public void setRunningDurationMs(Long runningDurationMs) { this.runningDurationMs = runningDurationMs; }
+    public long getScheduleIntervalMs() { return scheduleIntervalMs; }
+    public void setScheduleIntervalMs(long scheduleIntervalMs) { this.scheduleIntervalMs = scheduleIntervalMs; }
+    public long getScheduleGraceMs() { return scheduleGraceMs; }
+    public void setScheduleGraceMs(long scheduleGraceMs) { this.scheduleGraceMs = scheduleGraceMs; }
+    public Long getScheduleAnchorMs() { return scheduleAnchorMs; }
+    public void setScheduleAnchorMs(Long scheduleAnchorMs) { this.scheduleAnchorMs = scheduleAnchorMs; }
+    public Long getNextExpectedRunMs() { return nextExpectedRunMs; }
+    public void setNextExpectedRunMs(Long nextExpectedRunMs) { this.nextExpectedRunMs = nextExpectedRunMs; }
+    public int getMissedRounds() { return missedRounds; }
+    public void setMissedRounds(int missedRounds) { this.missedRounds = missedRounds; }
     public List<String> getReasons() { return reasons; }
 }

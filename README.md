@@ -1,8 +1,9 @@
 # 数据管道可观测性与告警聚合服务
 
 基于 Spring Boot 3.4 / Java 21 的进程内实现。管道运行事件通过内置 HTTP 接口上报，
-服务在内存中完成**状态收敛、健康判定（新鲜度 / 调度滞后 / SLA）、告警聚合**，
-使乱序、重复、并发的事件收敛到一致且可解释的结论。无需外部数据库或消息队列。
+服务在内存中完成**状态收敛、健康判定（新鲜度 / 调度周期错过轮次 / SLA）、告警聚合、
+被拒上报留痕与按管道对账**，使乱序、重复、并发的事件收敛到一致且可解释的结论。
+无需外部数据库或消息队列。
 
 ## 1. 事件协议
 
@@ -23,13 +24,19 @@
 
 ### 拒绝原因（绝不静默丢弃，HTTP 200/400 均带 `rejectCode`）
 
+六类原因彼此独立、一眼可分；每条被拒上报都会**留痕并按管道/原因计数**（见第 8 节）。
+
 | rejectCode | 触发条件 |
 |------------|----------|
-| `MISSING_FIELD` | 必填字段缺失 / 空字符串 / 请求体不是 JSON 对象 / 畸形 JSON |
-| `TYPE_MISMATCH` | 字段类型不符（如 protocolVersion 传数字、eventTime 传小数或字符串） |
+| `MALFORMED_PAYLOAD` | 整条报文结构不合法：畸形 JSON、或请求体不是 JSON 对象（连一个事件对象都算不上） |
+| `MISSING_FIELD` | 必填字段缺失 / 空字符串 |
+| `TYPE_MISMATCH` | 某个字段类型不符（如 protocolVersion 传数字、eventTime 传小数或字符串） |
 | `UNSUPPORTED_PROTOCOL_VERSION` | protocolVersion 不在允许列表 |
 | `UNKNOWN_STATUS` | status 不是五个合法枚举之一 |
-| `INVALID_TIMESTAMP` | 时间字段非正整数 |
+| `INVALID_TIMESTAMP` | 时间字段取值不合法（非正整数） |
+
+> 说明：畸形 JSON 此前返回的是 `TYPE_MISMATCH`，现按“整条报文不合法 vs 单个字段类型不对”
+> 细化为独立的 `MALFORMED_PAYLOAD`，两类问题不再挤在同一个原因里。
 
 响应示例：
 ```json
@@ -63,8 +70,21 @@ SLA_BREACHED / TRANSIENT_JITTER`，结果对象 `reasons` 数组给出判定依�
 - **NEVER_RAN**：从未有过成功运行，与“曾经正常而后超期”明确区分。
 - **SLA**：最近运行为 RUNNING 时，`now - 最早起点 > slaLimitMs` 判 `SLA_BREACHED`；
   `duration == slaLimit` 不告警（阈值语义为“超过才报”）。
-- **调度滞后**：最近运行未开始（无 RUNNING 起点）且带 scheduledTime，
-  `now - scheduledTime > scheduleGraceMs` 判 `SCHEDULE_LAGGING`；宽限内为 `TRANSIENT_JITTER`。
+- **调度滞后（最近一轮已到点、尚未开始）**：最近一次运行为 PENDING、无 RUNNING 起点且带
+  scheduledTime 时，针对“这一轮”的 scheduledTime 判：`lag = now - scheduledTime`，
+  `lag > scheduleGraceMs` 判 `SCHEDULE_LAGGING`；宽限内（含等号）为 `TRANSIENT_JITTER`。
+- **按调度周期推算“下一轮本该何时跑”**：对**显式配置过调度**（管道级配置了
+  `schedule-interval-ms` 或 `schedule-grace-ms`）且最近一次已 SUCCESS 的管道：
+  - 调度基准 `anchor`：优先取最近一次已知 scheduledTime，其次最近成功时间，再次最近结束时间；
+  - 下一轮应到时刻 `nextDue = anchor + scheduleIntervalMs`，`lag = now - nextDue`；
+  - `lag <= 0`：两轮之间还没到点 → **HEALTHY**；
+  - `0 < lag <= scheduleGraceMs`：宽限内的正常延迟 → **TRANSIENT_JITTER（不正式告警）**；
+  - `lag > scheduleGraceMs`：**SCHEDULE_LAGGING**，错过轮次
+    `missedRounds = floor((lag - grace - 1) / interval) + 1`（错过 1 轮 WARNING，
+    连续错过 ≥2 轮升级为 CRITICAL，错过越多结论越严重）。
+  - 边界含等号：`lag==0`、`lag==grace` 都不告警；把 `schedule-interval-ms` 调大/调小，
+    下一轮时刻与判定结果随之改变；刚补跑（RUNNING/SUCCESS）锚点立即刷新，下一次判定即恢复。
+  - 未配置调度的管道不套周期规则，仍只看新鲜度，避免给非周期管道误报。
 - **新鲜度**（距上次成功的时间 age）：
   - `age <= freshnessThreshold` → **HEALTHY（边界含等号，时钟边界不误报）**
   - `threshold < age <= threshold + jitterGrace` → **TRANSIENT_JITTER（短暂抖动，不产生正式告警）**
@@ -96,14 +116,51 @@ RUN_FAILED`；级别 `WARNING → CRITICAL`；状态 `FIRING / SUPPRESSED / RECO
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/observability/events` | 上报运行事件 |
-| GET  | `/api/observability/health/{pipeline}` | 单管道健康判定（含 reasons） |
+| GET  | `/api/observability/health/{pipeline}` | 单管道健康判定（含 reasons、nextDue、missedRounds） |
 | GET  | `/api/observability/health` | 全部管道健康判定 |
+| GET  | `/api/observability/reconciliation/{pipeline}` | 单管道运行质量×上报告警对账（同一口径） |
+| GET  | `/api/observability/reconciliation` | 全部管道对账 |
+| GET  | `/api/observability/rejections?pipeline=&reason=` | 被拒上报留痕明细（可按管道/原因过滤） |
+| GET  | `/api/observability/rejections/stats?pipeline=` | 每种拒绝原因的累计计数（pipeline 省略为全量） |
 | GET  | `/api/observability/alerts?includeRecovered=false` | 告警列表 |
 | POST | `/api/observability/alerts/{pipeline}/{type}/recover` | 手动恢复告警 |
 | POST | `/api/observability/maintenance` | 新增维护窗口 `{pipelineName?,startAt,endAt,note?}` |
 | GET  | `/api/observability/maintenance` | 维护窗口列表 |
 | GET  | `/api/observability/runs/{runId}` | 单运行收敛状态与转移日志 |
 | GET  | `/api/observability/snapshot` | 健康+告警+维护窗口总览 |
+
+## 5.1 被拒上报的留痕与分类查询
+
+每次拒绝（含畸形 JSON）都会写一条留痕：`rejectedAt / pipelineName / runId / rejectCode /
+reason / rawPayload`，同时按管道维护六类原因的原子计数。无法识别管道名的报文（如畸形体）
+归入 `_unknown_` 桶，仍留痕、不丢弃。
+
+```bash
+# 查某管道全部被拒明细
+curl -s 'localhost:8080/api/observability/rejections?pipeline=etl'
+# 只查某类原因
+curl -s 'localhost:8080/api/observability/rejections?pipeline=etl&reason=MISSING_FIELD'
+# 每类原因累计被拒多少条（六类齐全，未出现为 0）
+curl -s 'localhost:8080/api/observability/rejections/stats?pipeline=etl'
+# 全量
+curl -s 'localhost:8080/api/observability/rejections/stats'
+```
+
+## 5.2 运行质量 × 上报告警对账
+
+`GET /api/observability/reconciliation/{pipeline}` 在**该管道同一把锁**内依次完成
+“健康判定 → 告警对账 → 取活跃告警快照 → 取计数快照”，因此同一时刻返回的健康结论与告警状态
+必然同一口径、互不矛盾。返回字段：
+
+- `healthStatus` / `health`：当前健康结论与判定依据（含 nextDue、missedRounds、reasons）；
+- `activeAlerts`：对账时刻该管道的活跃告警（抑制中的也算活跃）；
+- `metrics`：`received / accepted / duplicate / late / rejected`，恒满足
+  `received = accepted + duplicate + late + rejected`（乱序、重复、迟到、并发都精确）；
+- `rejectedByReason`：六类拒绝原因累计数；
+- `alertMergedCount / alertSuppressedCount / alertNotifiedCount`：告警合并/抑制/通知计数；
+- `consistent` + `consistencyChecks`：自洽性结论与逐条依据。
+  HEALTHY 时不得残留活跃告警；STALE/SCHEDULE_LAGGING/SLA_BREACHED 必须有同类型活跃告警，
+  否则标记 `consistent=false` 并给出 `CONTRADICTION` 说明。
 
 ## 6. 可配置项（`src/main/resources/application.properties`）
 
@@ -113,34 +170,52 @@ RUN_FAILED`；级别 `WARNING → CRITICAL`；状态 `FIRING / SUPPRESSED / RECO
 | `observability.default-freshness-threshold-ms` | 3600000 | 新鲜度阈值 |
 | `observability.default-jitter-grace-ms` | 300000 | 抖动宽限 |
 | `observability.default-sla-limit-ms` | 7200000 | SLA 上限 |
-| `observability.default-schedule-interval-ms` | 3600000 | 调度间隔 |
-| `observability.default-schedule-grace-ms` | 120000 | 调度滞后宽限 |
+| `observability.default-schedule-interval-ms` | 3600000 | 调度间隔（下一轮 = 锚点 + 间隔） |
+| `observability.default-schedule-grace-ms` | 120000 | 调度滞后宽限（边界含等号） |
 | `observability.escalation-after-ms` | 1800000 | 告警升级时长 |
-| `observability.pipelines.<name>.*` | - | 按管道覆盖以上阈值（如 `freshness-threshold-ms`） |
+| `observability.pipelines.<name>.schedule-interval-ms` | - | 该管道显式调度间隔；配置后按周期判错过轮次 |
+| `observability.pipelines.<name>.schedule-grace-ms` | - | 该管道调度宽限覆盖 |
+| `observability.pipelines.<name>.*` | - | 按管道覆盖其它阈值（如 `freshness-threshold-ms`） |
+
+只有在管道级配置中出现了 `schedule-interval-ms` 或 `schedule-grace-ms`，该管道才会
+“按周期推算下一轮”；其余管道维持纯新鲜度语义。拒绝留痕明细默认保留最近 10000 条
+（超出丢弃最早，计数不受影响）。
 
 ## 7. 验证方法
 
 ```bash
-mvn test                 # 全部 23 个单测/集成测试
+mvn test                 # 全部 37 个单测/集成测试
 mvn spring-boot:run      # 启动服务，默认 8080 端口
 ```
 
 测试使用可拨动的 `MutableClock` 固定/推进时间，覆盖：
 
-- `EventIngestionValidationTest`：五类拒绝原因 + 合法事件；
+- `EventIngestionValidationTest`：字段级拒绝原因 + 合法事件；
+- `RejectionLedgerTest`：六类原因可区分、留痕可按管道/原因查询、各类计数精确；
 - `StateConvergenceTest`：精确重复、乱序终结、终结态不回退、起点乱序修正；
 - `ConcurrentIngestionTest`：16 线程 × 100 并发事件，计数不丢失、结论唯一、告警合并为一条；
+- `ConcurrentMetricsTest`：16 线程 × 200 混合（接受/重复/迟到/拒绝）精确计数且
+  `received = accepted+duplicate+late+rejected`，多管道计数隔离、快照稳定；
 - `FreshnessSlaBoundaryTest`：新鲜度等号边界、抖动带、NEVER_RAN、刚恢复不误报、
   SLA 等号/越界、调度滞后宽限边界；
+- `ScheduleMissBoundaryTest`：两轮之间不误报、周期/宽限等号边界、错过 1/2/3 轮递增、
+  WARNING→CRITICAL、调大/调小周期结论跟随、刚补跑立即恢复、PENDING 轮自身调度边界；
+- `ReconciliationConsistencyTest`：HEALTHY 无残留告警、异常结论必有同类告警、计数守恒、
+  全量对账全部自洽；
 - `AlertLifecycleTest`：重复合并只通知一次、超时升级、恢复无残留不重复通知、
   维护窗口抑制与窗口后补发；
-- `WebApiIntegrationTest`：HTTP 端到端、畸形 JSON 结构化拒绝。
+- `WebApiIntegrationTest`：HTTP 端到端、畸形 JSON 归 MALFORMED_PAYLOAD、留痕/统计/对账接口。
 
-所有关键测试均通过 SLF4J 打印 `[INPUT]/[RESULT]/[CHECK]/[ASSERT]` 等关键输入与判定依据。
+所有关键测试均通过 SLF4J 打印 `[INPUT]/[RESULT]/[CHECK]/[ASSERT]/[METRICS]/[REPORT]`
+等关键输入与判定依据。
 
 快速手工验证：
 ```bash
+# 1) 一条缺字段的上报（被拒留痕）
 curl -s -XPOST localhost:8080/api/observability/events -H 'Content-Type: application/json' \
-  -d '{"protocolVersion":"1.0","runId":"r1","pipelineName":"etl","status":"FAILED","eventTime":1700000000000}'
-curl -s localhost:8080/api/observability/alerts
+  -d '{"protocolVersion":"1.0","pipelineName":"etl","status":"RUNNING","eventTime":1700000000000}'
+# 2) 按管道看各类原因累计
+curl -s 'localhost:8080/api/observability/rejections/stats?pipeline=etl'
+# 3) 给 hourly-job 配置 1 小时周期后，查对账（健康结论、活跃告警、各项计数同一口径）
+curl -s localhost:8080/api/observability/reconciliation/hourly-job
 ```
