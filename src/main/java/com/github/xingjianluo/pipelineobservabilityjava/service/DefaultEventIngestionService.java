@@ -22,15 +22,18 @@ public class DefaultEventIngestionService implements EventIngestionService {
     private final ObservabilityProperties properties;
     private final AlertService alertService;
     private final HealthEvaluationService healthEvaluationService;
+    private final RejectionLogService rejectionLog;
 
     public DefaultEventIngestionService(RunStateStore store,
                                         ObservabilityProperties properties,
                                         AlertService alertService,
-                                        HealthEvaluationService healthEvaluationService) {
+                                        HealthEvaluationService healthEvaluationService,
+                                        RejectionLogService rejectionLog) {
         this.store = store;
         this.properties = properties;
         this.alertService = alertService;
         this.healthEvaluationService = healthEvaluationService;
+        this.rejectionLog = rejectionLog;
     }
 
     @Override
@@ -42,6 +45,9 @@ public class DefaultEventIngestionService implements EventIngestionService {
             event = parse(raw);
         } catch (EventRejectedException e) {
             log.warn("event rejected code={} reason={} raw={}", e.getCode(), e.getMessage(), raw);
+            // 留痕：尽最大努力从原文提取 pipelineName 便于按管道自查，解析不出也记录。
+            rejectionLog.record(extractPipelineName(raw), e.getCode(), e.getMessage(),
+                    raw == null ? null : raw.toString());
             return IngestResult.rejected(e.getCode(), e.getMessage());
         }
 
@@ -160,6 +166,17 @@ public class DefaultEventIngestionService implements EventIngestionService {
         return s;
     }
 
+    /** 从原始报文尽力提取 pipelineName（仅在是合法字符串时采用），用于拒绝留痕归组。 */
+    private static String extractPipelineName(JsonNode raw) {
+        if (raw != null && raw.isObject()) {
+            JsonNode n = raw.get("pipelineName");
+            if (n != null && n.isTextual() && !n.asText().isBlank()) {
+                return n.asText();
+            }
+        }
+        return null;
+    }
+
     private static int lifecycleRank(RunStatus status) {
         return switch (status) {
             case PENDING -> 0;
@@ -170,7 +187,8 @@ public class DefaultEventIngestionService implements EventIngestionService {
 
     private PipelineEvent parse(JsonNode raw) {
         if (raw == null || !raw.isObject()) {
-            throw new EventRejectedException(RejectCode.MISSING_FIELD, "request body must be a JSON object");
+            throw new EventRejectedException(RejectCode.MALFORMED_JSON,
+                    "request body must be a JSON object");
         }
         PipelineEvent ev = new PipelineEvent();
 

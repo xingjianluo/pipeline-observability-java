@@ -69,7 +69,8 @@ class WebApiIntegrationTest {
         String resp = rest.postForObject(url("/api/observability/events"),
                 new HttpEntity<>("{not-json", headers), String.class);
         log.info("[MALFORMED RESP] {}", resp);
-        assertTrue(resp.contains("TYPE_MISMATCH"), "malformed body must carry reject code");
+        // 整条报文格式不合法是独立原因，与字段级 TYPE_MISMATCH 区分开
+        assertTrue(resp.contains("MALFORMED_JSON"), "malformed body must carry reject code");
     }
 
     @Test
@@ -83,5 +84,64 @@ class WebApiIntegrationTest {
         log.info("[BAD PROTOCOL RESP] {}", resp);
         assertTrue(resp.contains("UNSUPPORTED_PROTOCOL_VERSION"));
         assertFalse(resp.contains("\"accepted\":true"));
+    }
+
+    @Test
+    void rejectionsAreQueryableByPipelineAndCodeOverHttp() throws Exception {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        // 同一管道制造两类拒绝：未知状态 + 不支持的协议版本
+        String bad1 = "{\"protocolVersion\":\"1.0\",\"runId\":\"wr-1\",\"pipelineName\":\"web-rej\","
+                + "\"status\":\"WHAT\",\"eventTime\":1700000000000}";
+        String bad2 = "{\"protocolVersion\":\"7.7\",\"runId\":\"wr-2\",\"pipelineName\":\"web-rej\","
+                + "\"status\":\"RUNNING\",\"eventTime\":1700000000000}";
+        rest.postForObject(url("/api/observability/events"), new HttpEntity<>(bad1, headers), String.class);
+        rest.postForObject(url("/api/observability/events"), new HttpEntity<>(bad2, headers), String.class);
+
+        String list = rest.getForObject(
+                url("/api/observability/rejections?pipeline=web-rej&code=UNKNOWN_STATUS"), String.class);
+        log.info("[REJECTIONS] {}", list);
+        JsonNode arr = mapper.readTree(list);
+        assertEquals(1, arr.size());
+        assertEquals("UNKNOWN_STATUS", arr.get(0).get("rejectCode").asText());
+        assertEquals("web-rej", arr.get(0).get("pipelineName").asText());
+
+        String summary = rest.getForObject(
+                url("/api/observability/rejections/summary?pipeline=web-rej"), String.class);
+        log.info("[REJECTION SUMMARY] {}", summary);
+        JsonNode s = mapper.readTree(summary);
+        assertEquals(2, s.get("total").asInt());
+        assertEquals(1, s.get("byCode").get("UNKNOWN_STATUS").asInt());
+        assertEquals(1, s.get("byCode").get("UNSUPPORTED_PROTOCOL_VERSION").asInt());
+        assertEquals(0, s.get("byCode").get("MALFORMED_JSON").asInt());
+    }
+
+    @Test
+    void reconciliationEndpointGivesConsistentView() throws Exception {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        long t = System.currentTimeMillis();
+        String ok = "{\"protocolVersion\":\"1.0\",\"runId\":\"wrc-1\",\"pipelineName\":\"web-recon\","
+                + "\"status\":\"SUCCESS\",\"eventTime\":" + t + "}";
+        String dup = ok;
+        String bad = "{\"protocolVersion\":\"1.0\",\"runId\":\"wrc-2\",\"pipelineName\":\"web-recon\","
+                + "\"status\":\"NOPE\",\"eventTime\":" + t + "}";
+        rest.postForObject(url("/api/observability/events"), new HttpEntity<>(ok, headers), String.class);
+        rest.postForObject(url("/api/observability/events"), new HttpEntity<>(dup, headers), String.class);
+        rest.postForObject(url("/api/observability/events"), new HttpEntity<>(bad, headers), String.class);
+
+        String recon = rest.getForObject(
+                url("/api/observability/pipelines/web-recon/reconciliation"), String.class);
+        log.info("[RECONCILIATION] {}", recon);
+        JsonNode r = mapper.readTree(recon);
+        assertEquals("web-recon", r.get("pipelineName").asText());
+        assertEquals("HEALTHY", r.get("health").get("status").asText());
+        // 同一口径：HEALTHY 时不得挂任何活跃告警
+        assertEquals(0, r.get("activeAlerts").size());
+        assertEquals(2, r.get("receivedEvents").asInt());
+        assertEquals(1, r.get("duplicateEvents").asInt());
+        assertEquals(1, r.get("appliedEvents").asInt());
+        assertEquals(1, r.get("rejectedEvents").asInt());
+        assertEquals(1, r.get("rejectionsByCode").get("UNKNOWN_STATUS").asInt());
     }
 }

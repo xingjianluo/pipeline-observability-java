@@ -33,6 +33,9 @@ public class ObservabilityProperties {
     /** 告警升级时长（毫秒）：告警持续超过该值从 WARNING 升级 CRITICAL。 */
     private long escalationAfterMs = 1_800_000L;
 
+    /** 连续错过多少轮调度即视为严重（告警直接以 CRITICAL 触发/升级）。 */
+    private int criticalMissedRuns = 2;
+
     /** 管道级覆盖配置，key 为 pipelineName。 */
     private Map<String, Thresholds> pipelines = new LinkedHashMap<>();
 
@@ -92,6 +95,8 @@ public class ObservabilityProperties {
     public void setDefaultScheduleGraceMs(long v) { this.defaultScheduleGraceMs = v; }
     public long getEscalationAfterMs() { return escalationAfterMs; }
     public void setEscalationAfterMs(long v) { this.escalationAfterMs = v; }
+    public int getCriticalMissedRuns() { return criticalMissedRuns; }
+    public void setCriticalMissedRuns(int v) { this.criticalMissedRuns = v; }
     public Map<String, Thresholds> getPipelines() { return pipelines; }
     public void setPipelines(Map<String, Thresholds> pipelines) { this.pipelines = pipelines; }
 }

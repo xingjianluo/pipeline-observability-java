@@ -17,11 +17,16 @@ import com.github.xingjianluo.pipelineobservabilityjava.model.AlertType;
 import com.github.xingjianluo.pipelineobservabilityjava.model.HealthAssessment;
 import com.github.xingjianluo.pipelineobservabilityjava.model.IngestResult;
 import com.github.xingjianluo.pipelineobservabilityjava.model.MaintenanceWindow;
+import com.github.xingjianluo.pipelineobservabilityjava.model.PipelineReconciliation;
 import com.github.xingjianluo.pipelineobservabilityjava.model.PipelineRunState;
+import com.github.xingjianluo.pipelineobservabilityjava.model.RejectCode;
+import com.github.xingjianluo.pipelineobservabilityjava.model.RejectionRecord;
 import com.github.xingjianluo.pipelineobservabilityjava.service.AlertService;
 import com.github.xingjianluo.pipelineobservabilityjava.service.EventIngestionService;
 import com.github.xingjianluo.pipelineobservabilityjava.service.HealthEvaluationService;
 import com.github.xingjianluo.pipelineobservabilityjava.service.MaintenanceService;
+import com.github.xingjianluo.pipelineobservabilityjava.service.ReconciliationService;
+import com.github.xingjianluo.pipelineobservabilityjava.service.RejectionLogService;
 import com.github.xingjianluo.pipelineobservabilityjava.store.RunStateStore;
 import com.github.xingjianluo.pipelineobservabilityjava.time.SystemClock;
 
@@ -34,6 +39,8 @@ public class ObservabilityController {
     private final HealthEvaluationService health;
     private final AlertService alerts;
     private final MaintenanceService maintenance;
+    private final RejectionLogService rejections;
+    private final ReconciliationService reconciliation;
     private final RunStateStore store;
     private final SystemClock clock;
 
@@ -41,12 +48,16 @@ public class ObservabilityController {
                                    HealthEvaluationService health,
                                    AlertService alerts,
                                    MaintenanceService maintenance,
+                                   RejectionLogService rejections,
+                                   ReconciliationService reconciliation,
                                    RunStateStore store,
                                    SystemClock clock) {
         this.ingestion = ingestion;
         this.health = health;
         this.alerts = alerts;
         this.maintenance = maintenance;
+        this.rejections = rejections;
+        this.reconciliation = reconciliation;
         this.store = store;
         this.clock = clock;
     }
@@ -85,6 +96,26 @@ public class ObservabilityController {
         return maintenance.list();
     }
 
+    /** 被拒上报留痕查询：可按管道、按拒绝原因过滤。 */
+    @GetMapping("/rejections")
+    public List<RejectionRecord> rejections(
+            @RequestParam(required = false) String pipeline,
+            @RequestParam(required = false) String code) {
+        RejectCode rejectCode = code == null || code.isBlank() ? null : RejectCode.valueOf(code);
+        return rejections.query(
+                pipeline == null || pipeline.isBlank() ? null : pipeline, rejectCode);
+    }
+
+    /** 每种拒绝原因各自累计被拒条数（可按管道过滤）。 */
+    @GetMapping("/rejections/summary")
+    public Map<String, Object> rejectionSummary(@RequestParam(required = false) String pipeline) {
+        String p = pipeline == null || pipeline.isBlank() ? null : pipeline;
+        return Map.of(
+                "pipeline", p == null ? "*" : p,
+                "total", rejections.totalCount(p),
+                "byCode", rejections.countByCode(p));
+    }
+
     @PostMapping("/alerts/{pipeline}/{type}/recover")
     public Alert recover(@PathVariable String pipeline, @PathVariable String type) {
         return alerts.recover(pipeline, AlertType.valueOf(type), clock.nowMillis());
@@ -93,6 +124,12 @@ public class ObservabilityController {
     @GetMapping("/runs/{runId}")
     public PipelineRunState run(@PathVariable String runId) {
         return store.find(runId).orElse(null);
+    }
+
+    /** 单管道对账：同一时刻、同一口径的健康结论 + 告警状态 + 接收/重复/迟到/被拒/告警合并计数。 */
+    @GetMapping("/pipelines/{pipeline}/reconciliation")
+    public PipelineReconciliation reconciliation(@PathVariable String pipeline) {
+        return reconciliation.reconcile(pipeline);
     }
 
     @GetMapping("/snapshot")

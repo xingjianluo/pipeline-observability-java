@@ -16,6 +16,14 @@ public final class HealthAssessment {
     private Long expectedScheduleMs;
     private Long observedLagMs;
     private Long runningDurationMs;
+    /** 生效的调度间隔（毫秒），用于推算下一轮本该运行的时刻。 */
+    private long scheduleIntervalMs;
+    /** 按调度间隔推算出的下一轮本该运行的时刻（epoch 毫秒）。 */
+    private Long expectedNextRunMs;
+    /** 已连续错过的调度轮数（0 表示未错过）。 */
+    private long missedRunCount;
+    /** 评估给出的告警级别建议（如连续多轮缺跑时直接 CRITICAL），null 表示按默认 WARNING。 */
+    private AlertSeverity suggestedSeverity;
     private final List<String> reasons = new ArrayList<>();
 
     public HealthAssessment() {
@@ -43,5 +51,13 @@ public final class HealthAssessment {
     public void setObservedLagMs(Long observedLagMs) { this.observedLagMs = observedLagMs; }
     public Long getRunningDurationMs() { return runningDurationMs; }
     public void setRunningDurationMs(Long runningDurationMs) { this.runningDurationMs = runningDurationMs; }
+    public long getScheduleIntervalMs() { return scheduleIntervalMs; }
+    public void setScheduleIntervalMs(long scheduleIntervalMs) { this.scheduleIntervalMs = scheduleIntervalMs; }
+    public Long getExpectedNextRunMs() { return expectedNextRunMs; }
+    public void setExpectedNextRunMs(Long expectedNextRunMs) { this.expectedNextRunMs = expectedNextRunMs; }
+    public long getMissedRunCount() { return missedRunCount; }
+    public void setMissedRunCount(long missedRunCount) { this.missedRunCount = missedRunCount; }
+    public AlertSeverity getSuggestedSeverity() { return suggestedSeverity; }
+    public void setSuggestedSeverity(AlertSeverity suggestedSeverity) { this.suggestedSeverity = suggestedSeverity; }
     public List<String> getReasons() { return reasons; }
 }

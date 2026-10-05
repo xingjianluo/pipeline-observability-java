@@ -25,7 +25,8 @@
 
 | rejectCode | 触发条件 |
 |------------|----------|
-| `MISSING_FIELD` | 必填字段缺失 / 空字符串 / 请求体不是 JSON 对象 / 畸形 JSON |
+| `MALFORMED_JSON` | 整条报文格式不合法：非 JSON、畸形 JSON、或 JSON 不是对象 |
+| `MISSING_FIELD` | 必填字段缺失 / 空字符串 |
 | `TYPE_MISMATCH` | 字段类型不符（如 protocolVersion 传数字、eventTime 传小数或字符串） |
 | `UNSUPPORTED_PROTOCOL_VERSION` | protocolVersion 不在允许列表 |
 | `UNKNOWN_STATUS` | status 不是五个合法枚举之一 |
@@ -37,6 +38,17 @@
   "rejectCode": "UNSUPPORTED_PROTOCOL_VERSION",
   "message": "protocolVersion '2.0' not supported, allowed=[1.0, 1.1]" }
 ```
+
+### 拒绝留痕与自查
+
+每一次被拒绝的上报都会留痕（`RejectionRecord`：序号、管道名、拒绝原因、说明、
+原文片段、拒绝时刻），管道名从原始报文中尽力提取，解析不出时归入 `<unknown>`。
+留痕与计数均为线程安全的原子累加，并发被拒不丢不重。
+
+- `GET /api/observability/rejections?pipeline=<名>&code=<原因>`：按管道、按原因过滤
+  查询留痕明细（参数均可省略）。
+- `GET /api/observability/rejections/summary?pipeline=<名>`：每种原因各自累计被拒
+  条数（`byCode`）与总数（`total`）；省略 `pipeline` 时统计全局。
 
 ## 2. 运行状态收敛规则
 
@@ -65,6 +77,22 @@ SLA_BREACHED / TRANSIENT_JITTER`，结果对象 `reasons` 数组给出判定依�
   `duration == slaLimit` 不告警（阈值语义为“超过才报”）。
 - **调度滞后**：最近运行未开始（无 RUNNING 起点）且带 scheduledTime，
   `now - scheduledTime > scheduleGraceMs` 判 `SCHEDULE_LAGGING`；宽限内为 `TRANSIENT_JITTER`。
+- **调度周期（按配置的间隔推算下一轮）**：每个管道按 `scheduleIntervalMs` 推算
+  “下一轮本该什么时候跑”：`expectedNextRun = max(最近成功, 最近起点, 已见调度时刻)
+  + scheduleIntervalMs`。判定宽限取 `max(scheduleGraceMs, jitterGraceMs)`，
+  保证与新鲜度抖动带同一口径、互不矛盾：
+  - `now <= expectedNextRun` → 两轮之间还没到点，正常，**不出正式告警**；
+  - `expectedNextRun < now <= expectedNextRun + 宽限` → 正常范围内的延迟，
+    `TRANSIENT_JITTER`，**不出正式告警**（边界含等号，踩在周期/宽限边界上不误报）；
+  - `now > expectedNextRun + 宽限` → 已错过调度，判 `SCHEDULE_LAGGING` 并告警。
+    错过轮数 `missedRunCount` = 满足 `anchor + k*interval + 宽限 < now` 的轮数
+    （第 k 轮的宽限边界含等号，恰好踩界不计为错过）；连续错过轮数
+    `>= criticalMissedRuns` 时告警直接以 **CRITICAL** 触发/升级（错过越多越严重）。
+  - 评估结果携带 `expectedNextRunMs / observedLagMs / missedRunCount /
+    suggestedSeverity` 字段，`reasons` 中给出完整推算过程。
+  - 新鲜度已 `STALE` 时以 `STALE` 为准（缺轮信息仍记录在字段中）。
+  - 把 `scheduleIntervalMs` 调大或调小，期望时刻与缺轮判定随之变化；
+    刚刚补跑成功的管道锚点立即刷新、缺轮清零，告警同口径关闭。
 - **新鲜度**（距上次成功的时间 age）：
   - `age <= freshnessThreshold` → **HEALTHY（边界含等号，时钟边界不误报）**
   - `threshold < age <= threshold + jitterGrace` → **TRANSIENT_JITTER（短暂抖动，不产生正式告警）**
@@ -103,7 +131,24 @@ RUN_FAILED`；级别 `WARNING → CRITICAL`；状态 `FIRING / SUPPRESSED / RECO
 | POST | `/api/observability/maintenance` | 新增维护窗口 `{pipelineName?,startAt,endAt,note?}` |
 | GET  | `/api/observability/maintenance` | 维护窗口列表 |
 | GET  | `/api/observability/runs/{runId}` | 单运行收敛状态与转移日志 |
+| GET  | `/api/observability/rejections?pipeline=&code=` | 被拒上报留痕查询（可按管道/原因过滤） |
+| GET  | `/api/observability/rejections/summary?pipeline=` | 各拒绝原因累计被拒条数 |
+| GET  | `/api/observability/pipelines/{pipeline}/reconciliation` | 单管道运行质量与告警对账 |
 | GET  | `/api/observability/snapshot` | 健康+告警+维护窗口总览 |
+
+### 对账接口（结论与计数同一口径）
+
+`GET /api/observability/pipelines/{pipeline}/reconciliation` 返回：
+
+- `health`：当前健康结论（含判定依据 `reasons` 与调度推算字段）；
+- `activeAlerts`：对账后的活跃告警——先在 `evaluatedAt` 时刻完成健康评估与告警
+  对账再取快照，因此健康结论与告警状态**同一口径、互不矛盾**
+  （HEALTHY 时活跃告警必为空；异常时对应告警必在挂）；
+- 计数：`receivedEvents`（接收总数）、`duplicateEvents`（精确重复）、
+  `lateEvents`（迟到忽略）、`appliedEvents`（= received − duplicate − late）、
+  `rejectedEvents` 与 `rejectionsByCode`（被拒总数及分原因计数）、
+  `alertMergedCount`（告警合并计数）、`runsTracked`。
+  所有计数在并发/乱序/重复下原子累加，精确不丢不重。
 
 ## 6. 可配置项（`src/main/resources/application.properties`）
 
@@ -113,34 +158,55 @@ RUN_FAILED`；级别 `WARNING → CRITICAL`；状态 `FIRING / SUPPRESSED / RECO
 | `observability.default-freshness-threshold-ms` | 3600000 | 新鲜度阈值 |
 | `observability.default-jitter-grace-ms` | 300000 | 抖动宽限 |
 | `observability.default-sla-limit-ms` | 7200000 | SLA 上限 |
-| `observability.default-schedule-interval-ms` | 3600000 | 调度间隔 |
+| `observability.default-schedule-interval-ms` | 3600000 | 调度间隔（推算下一轮本该运行的时刻） |
 | `observability.default-schedule-grace-ms` | 120000 | 调度滞后宽限 |
 | `observability.escalation-after-ms` | 1800000 | 告警升级时长 |
-| `observability.pipelines.<name>.*` | - | 按管道覆盖以上阈值（如 `freshness-threshold-ms`） |
+| `observability.critical-missed-runs` | 2 | 连续错过多少轮调度即视为严重（告警直接 CRITICAL） |
+| `observability.pipelines.<name>.*` | - | 按管道覆盖以上阈值（如 `schedule-interval-ms`、`freshness-threshold-ms`） |
 
 ## 7. 验证方法
 
 ```bash
-mvn test                 # 全部 23 个单测/集成测试
+mvn test                 # 全部 31 个单测/集成测试
 mvn spring-boot:run      # 启动服务，默认 8080 端口
 ```
 
 测试使用可拨动的 `MutableClock` 固定/推进时间，覆盖：
 
-- `EventIngestionValidationTest`：五类拒绝原因 + 合法事件；
+- `EventIngestionValidationTest`：五类字段级拒绝原因 + 合法事件；
+- `RejectionAuditTest`：六类拒绝原因可区分、全部留痕、按管道/原因查询、
+  各原因计数精确、被接受事件不留痕；
 - `StateConvergenceTest`：精确重复、乱序终结、终结态不回退、起点乱序修正；
 - `ConcurrentIngestionTest`：16 线程 × 100 并发事件，计数不丢失、结论唯一、告警合并为一条；
+- `ConcurrentExactCountTest`：8 线程并发混合流量（合法/重复/迟到/非法），
+  接收/重复/迟到/被拒计数精确，并发对账快照恒满足
+  `received == applied + duplicate + late` 且健康与告警口径自洽；
 - `FreshnessSlaBoundaryTest`：新鲜度等号边界、抖动带、NEVER_RAN、刚恢复不误报、
   SLA 等号/越界、调度滞后宽限边界；
+- `ScheduleIntervalBoundaryTest`：按配置调度周期推算下一轮、周期/宽限等号边界不误报、
+  连续缺轮计数与 CRITICAL 升级、周期调大调小结论跟着变、补跑后立即恢复；
 - `AlertLifecycleTest`：重复合并只通知一次、超时升级、恢复无残留不重复通知、
   维护窗口抑制与窗口后补发；
-- `WebApiIntegrationTest`：HTTP 端到端、畸形 JSON 结构化拒绝。
+- `ReconciliationConsistencyTest`：对账视图的健康结论与告警状态同口径
+  （STALE 时告警在挂、恢复后无残留），计数与实际上报逐条对得上；
+- `WebApiIntegrationTest`：HTTP 端到端、畸形 JSON 结构化拒绝（MALFORMED_JSON）、
+  拒绝留痕查询/汇总接口、对账接口。
 
 所有关键测试均通过 SLF4J 打印 `[INPUT]/[RESULT]/[CHECK]/[ASSERT]` 等关键输入与判定依据。
 
 快速手工验证：
 ```bash
+# 上报一条失败事件并查看告警
 curl -s -XPOST localhost:8080/api/observability/events -H 'Content-Type: application/json' \
   -d '{"protocolVersion":"1.0","runId":"r1","pipelineName":"etl","status":"FAILED","eventTime":1700000000000}'
 curl -s localhost:8080/api/observability/alerts
+
+# 制造一条被拒上报并自查留痕与分原因计数
+curl -s -XPOST localhost:8080/api/observability/events -H 'Content-Type: application/json' \
+  -d '{"protocolVersion":"9.9","runId":"r2","pipelineName":"etl","status":"RUNNING","eventTime":1700000000000}'
+curl -s 'localhost:8080/api/observability/rejections?pipeline=etl'
+curl -s 'localhost:8080/api/observability/rejections/summary?pipeline=etl'
+
+# 查看单管道对账（健康结论 + 告警 + 计数，同一口径）
+curl -s localhost:8080/api/observability/pipelines/etl/reconciliation
 ```

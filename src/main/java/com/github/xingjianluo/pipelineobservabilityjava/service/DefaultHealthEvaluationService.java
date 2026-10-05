@@ -110,7 +110,7 @@ public class DefaultHealthEvaluationService implements HealthEvaluationService {
                             + t.getScheduleGraceMs() + "ms, treated as transient jitter");
                 }
             } else {
-                verdict = assessByFreshness(a, lastSuccess, t, atMillis, null);
+                verdict = assessWithSchedule(a, lastSuccess, lastStart, latest, t, atMillis);
             }
         }
         a.setStatus(verdict);
@@ -118,6 +118,78 @@ public class DefaultHealthEvaluationService implements HealthEvaluationService {
                 pipelineName, atMillis, verdict, lastSuccess, t.getFreshnessThresholdMs(),
                 t.getJitterGraceMs(), a.getReasons());
         return a;
+    }
+
+    /**
+     * 新鲜度 + 调度周期联合判定。按配置的调度间隔推算“下一轮本该什么时候跑”：
+     * 期望时刻 = max(最近成功, 最近起点, 已见调度时刻) + scheduleIntervalMs。
+     * 时钟边界语义（宽限取 scheduleGrace 与 jitterGrace 的较大者，保证与新鲜度抖动带同口径）：
+     *   now <= 期望时刻                    => 还没到点，正常
+     *   期望时刻 < now <= 期望时刻+宽限     => TRANSIENT_JITTER（正常范围内的延迟，不出正式告警）
+     *   now > 期望时刻+宽限                => 已错过调度；错过轮数 = 满足 anchor+k*interval+grace < now 的 k 个数
+     * 错过轮数 >= criticalMissedRuns 时建议告警级别直接 CRITICAL（错过越多越严重）。
+     * 新鲜度已 STALE 时以 STALE 为准（缺轮信息仍记录在字段与 reasons 中）。
+     */
+    private FreshnessStatus assessWithSchedule(HealthAssessment a, Long lastSuccess, Long lastStart,
+                                               PipelineRunState latest, Thresholds t, long atMillis) {
+        FreshnessStatus freshness = assessByFreshness(a, lastSuccess, t, atMillis, null);
+        a.setScheduleIntervalMs(t.getScheduleIntervalMs());
+
+        Long anchor = max(lastSuccess, lastStart, latest.getScheduledTimeSeen());
+        if (anchor == null) {
+            a.getReasons().add("no schedule anchor (no success/start/scheduled time), "
+                    + "schedule-based check skipped");
+            return freshness;
+        }
+        long interval = t.getScheduleIntervalMs();
+        long grace = Math.max(t.getScheduleGraceMs(), t.getJitterGraceMs());
+        long expectedNext = anchor + interval;
+        long lateness = atMillis - expectedNext;
+        a.setExpectedNextRunMs(expectedNext);
+        a.setObservedLagMs(lateness);
+
+        long missed = 0;
+        if (lateness > grace) {
+            // 错过轮数：第 k 轮在 anchor+k*interval+grace 仍未运行即计为错过（边界含等号不误报）。
+            missed = (lateness - grace - 1) / interval + 1;
+        }
+        a.setMissedRunCount(missed);
+        a.getReasons().add("schedule: anchor=" + anchor + " interval=" + interval
+                + "ms expectedNext=" + expectedNext + " lateness=" + lateness
+                + "ms grace=" + grace + "ms missedRuns=" + missed);
+
+        if (freshness == FreshnessStatus.STALE) {
+            a.getReasons().add("freshness STALE takes precedence over schedule-miss verdict");
+            return freshness;
+        }
+        if (missed >= 1) {
+            if (missed >= properties.getCriticalMissedRuns()) {
+                a.setSuggestedSeverity(com.github.xingjianluo.pipelineobservabilityjava
+                        .model.AlertSeverity.CRITICAL);
+                a.getReasons().add("missed " + missed + " consecutive scheduled runs >= criticalMissedRuns "
+                        + properties.getCriticalMissedRuns() + ", severity suggested CRITICAL");
+            } else {
+                a.getReasons().add("missed " + missed + " scheduled run(s), severity WARNING");
+            }
+            return FreshnessStatus.SCHEDULE_LAGGING;
+        }
+        if (lateness > 0) {
+            a.getReasons().add("past expected next run by " + lateness
+                    + "ms, within grace, treated as transient jitter (no formal alert)");
+            return FreshnessStatus.TRANSIENT_JITTER;
+        }
+        a.getReasons().add("next scheduled run not due yet (due at " + expectedNext + ")");
+        return freshness;
+    }
+
+    private static Long max(Long... values) {
+        Long result = null;
+        for (Long v : values) {
+            if (v != null && (result == null || v > result)) {
+                result = v;
+            }
+        }
+        return result;
     }
 
     /**

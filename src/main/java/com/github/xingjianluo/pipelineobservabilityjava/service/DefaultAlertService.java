@@ -60,7 +60,8 @@ public class DefaultAlertService implements AlertService {
             return null;
         }
         return merge(assessment.getPipelineName(), type, atMillis,
-                assessment.getStatus().name() + ": " + String.join("; ", assessment.getReasons()));
+                assessment.getStatus().name() + ": " + String.join("; ", assessment.getReasons()),
+                assessment.getSuggestedSeverity());
     }
 
     private static AlertType map(FreshnessStatus s) {
@@ -75,19 +76,25 @@ public class DefaultAlertService implements AlertService {
     @Override
     public Alert reportFailure(String pipelineName, String runId, long atMillis, String detail) {
         return merge(pipelineName, AlertType.RUN_FAILED, atMillis,
-                "runId=" + runId + " " + detail);
+                "runId=" + runId + " " + detail, null);
     }
 
     /**
      * 原子合并：ConcurrentMap.compute 对同一 key 串行，并发上报计数绝不丢失。
      * 迟到（atMillis 早于已处理时间）的观测直接忽略，不回退结论。
+     * minSeverity 为评估给出的级别建议（如连续多轮缺跑），只升不降。
      */
-    private Alert merge(String pipeline, AlertType type, long atMillis, String detail) {
+    private Alert merge(String pipeline, AlertType type, long atMillis, String detail,
+                        AlertSeverity minSeverity) {
         boolean suppressedNow = maintenanceService.isSuppressed(pipeline, atMillis);
         Alert result = active.compute(key(pipeline, type), (k, cur) -> {
             if (cur == null) {
                 Alert a = newAlert(pipeline, type, atMillis, detail);
                 a.setCount(1);
+                if (minSeverity == AlertSeverity.CRITICAL) {
+                    a.setSeverity(AlertSeverity.CRITICAL);
+                    a.setEscalatedCount(a.getEscalatedCount() + 1);
+                }
                 if (suppressedNow) {
                     a.setState(AlertState.SUPPRESSED);
                     a.setSuppressedCount(1);
@@ -117,6 +124,7 @@ public class DefaultAlertService implements AlertService {
                     cur.setState(AlertState.SUPPRESSED);
                     log.info("alert suppressed by maintenance pipeline={} type={}", pipeline, type);
                 }
+                applyMinSeverity(cur, minSeverity, atMillis, false);
                 maybeEscalate(cur, atMillis, false);
                 return cur;
             }
@@ -129,10 +137,26 @@ public class DefaultAlertService implements AlertService {
                 log.info("alert re-fired after maintenance pipeline={} type={} severity={}",
                         pipeline, type, cur.getSeverity());
             }
+            applyMinSeverity(cur, minSeverity, atMillis, true);
             maybeEscalate(cur, atMillis, true);
             return cur;
         });
         return copyOf(result);
+    }
+
+    /** 评估建议级别只升不降：WARNING -> CRITICAL 时记一次升级并按需通知。 */
+    private void applyMinSeverity(Alert a, AlertSeverity minSeverity, long atMillis,
+                                  boolean allowNotify) {
+        if (minSeverity == AlertSeverity.CRITICAL && a.getSeverity() == AlertSeverity.WARNING) {
+            a.setSeverity(AlertSeverity.CRITICAL);
+            a.setEscalatedCount(a.getEscalatedCount() + 1);
+            if (allowNotify) {
+                a.setNotifiedCount(a.getNotifiedCount() + 1);
+                sink.notifyEscalation(copyOf(a));
+            }
+            log.info("alert escalated by severity suggestion pipeline={} type={} at={} notified={}",
+                    a.getPipelineName(), a.getType(), atMillis, allowNotify);
+        }
     }
 
     /** 达到升级时长则 WARNING -> CRITICAL；抑制期间只升级级别、不发升级通知。 */
