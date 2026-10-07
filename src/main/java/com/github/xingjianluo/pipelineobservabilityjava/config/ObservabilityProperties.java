@@ -36,6 +36,12 @@ public class ObservabilityProperties {
     /** 连续错过多少轮调度即视为严重（告警直接以 CRITICAL 触发/升级）。 */
     private int criticalMissedRuns = 2;
 
+    /**
+     * 拒绝留痕明细的容量上限（条）：超出后按到达先后淘汰最旧明细，内存有界；
+     * 按管道/按原因的累计计数不受影响，始终精确。
+     */
+    private int rejectionLogCapacity = 10_000;
+
     /** 管道级覆盖配置，key 为 pipelineName。 */
     private Map<String, Thresholds> pipelines = new LinkedHashMap<>();
 
@@ -97,6 +103,8 @@ public class ObservabilityProperties {
     public void setEscalationAfterMs(long v) { this.escalationAfterMs = v; }
     public int getCriticalMissedRuns() { return criticalMissedRuns; }
     public void setCriticalMissedRuns(int v) { this.criticalMissedRuns = v; }
+    public int getRejectionLogCapacity() { return rejectionLogCapacity; }
+    public void setRejectionLogCapacity(int v) { this.rejectionLogCapacity = v; }
     public Map<String, Thresholds> getPipelines() { return pipelines; }
     public void setPipelines(Map<String, Thresholds> pipelines) { this.pipelines = pipelines; }
 }

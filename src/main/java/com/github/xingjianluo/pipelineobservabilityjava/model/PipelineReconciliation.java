@@ -30,6 +30,14 @@ public final class PipelineReconciliation {
     private long alertMergedCount;
     /** 该管道当前跟踪的运行实例数。 */
     private long runsTracked;
+    /**
+     * 这份对账是否自洽：健康结论、告警状态与各项计数均取自同一互斥临界区内的同一时刻，
+     * 且通过口径校验（计数恒等式 + 健康结论与活跃告警互相印证）才为 true。
+     * 校验不通过时服务直接报错返回，绝不把矛盾结果悄悄交给调用方。
+     */
+    private boolean consistent;
+    /** 自洽判断依据（做了哪些校验、各自结果），便于调用方核对口径。 */
+    private List<String> consistencyBasis = List.of();
 
     public String getPipelineName() { return pipelineName; }
     public void setPipelineName(String pipelineName) { this.pipelineName = pipelineName; }
@@ -55,4 +63,8 @@ public final class PipelineReconciliation {
     public void setAlertMergedCount(long alertMergedCount) { this.alertMergedCount = alertMergedCount; }
     public long getRunsTracked() { return runsTracked; }
     public void setRunsTracked(long runsTracked) { this.runsTracked = runsTracked; }
+    public boolean isConsistent() { return consistent; }
+    public void setConsistent(boolean consistent) { this.consistent = consistent; }
+    public List<String> getConsistencyBasis() { return consistencyBasis; }
+    public void setConsistencyBasis(List<String> consistencyBasis) { this.consistencyBasis = consistencyBasis; }
 }

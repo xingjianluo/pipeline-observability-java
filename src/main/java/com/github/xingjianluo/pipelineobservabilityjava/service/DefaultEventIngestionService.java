@@ -12,6 +12,7 @@ import com.github.xingjianluo.pipelineobservabilityjava.model.PipelineRunState;
 import com.github.xingjianluo.pipelineobservabilityjava.model.RejectCode;
 import com.github.xingjianluo.pipelineobservabilityjava.model.RunStatus;
 import com.github.xingjianluo.pipelineobservabilityjava.store.RunStateStore;
+import com.github.xingjianluo.pipelineobservabilityjava.time.SystemClock;
 
 @Service
 public class DefaultEventIngestionService implements EventIngestionService {
@@ -23,17 +24,23 @@ public class DefaultEventIngestionService implements EventIngestionService {
     private final AlertService alertService;
     private final HealthEvaluationService healthEvaluationService;
     private final RejectionLogService rejectionLog;
+    private final SystemClock clock;
+    private final java.util.concurrent.locks.ReentrantLock lock;
 
     public DefaultEventIngestionService(RunStateStore store,
                                         ObservabilityProperties properties,
                                         AlertService alertService,
                                         HealthEvaluationService healthEvaluationService,
-                                        RejectionLogService rejectionLog) {
+                                        RejectionLogService rejectionLog,
+                                        SystemClock clock,
+                                        java.util.concurrent.locks.ReentrantLock observabilityLock) {
         this.store = store;
         this.properties = properties;
         this.alertService = alertService;
         this.healthEvaluationService = healthEvaluationService;
         this.rejectionLog = rejectionLog;
+        this.clock = clock;
+        this.lock = observabilityLock;
     }
 
     @Override
@@ -52,9 +59,22 @@ public class DefaultEventIngestionService implements EventIngestionService {
         }
 
         // 2) 在按 runId 串行化的临界区内完成状态机收敛，保证乱序/并发结论一致。
+        //    收敛 + 联动对账与显式对账共用同一把互斥锁：对账方看到的永远是
+        //    “事件已应用且告警已同口径联动”的完整中间态，不会拼出矛盾快照。
         final PipelineEvent ev = event;
         ConvergenceOutcome outcome = new ConvergenceOutcome();
-        PipelineRunState state = store.compute(ev.getRunId(), s -> converge(s, ev, outcome));
+        PipelineRunState state;
+        lock.lock();
+        try {
+            state = store.compute(ev.getRunId(), s -> converge(s, ev, outcome));
+            if (!outcome.duplicate && !outcome.lateIgnored) {
+                // 事件真正推进状态后，按服务时钟联动一次健康判定与告警对账（SLA/新鲜度告警随之收敛）。
+                // 与查询/对账路径使用同一个 SystemClock，保证同一时刻结论与告警状态口径一致。
+                healthEvaluationService.assessAndReconcile(ev.getPipelineName(), clock.nowMillis());
+            }
+        } finally {
+            lock.unlock();
+        }
 
         IngestResult r = new IngestResult();
         r.setRunId(ev.getRunId());
@@ -72,16 +92,13 @@ public class DefaultEventIngestionService implements EventIngestionService {
         }
         log.info("converged runId={} status={} version={} duplicate={} reason={}",
                 ev.getRunId(), state.getStatus(), state.getVersion(), outcome.duplicate, outcome.reason);
-        if (!outcome.duplicate && !outcome.lateIgnored) {
-            // 事件真正推进状态后，按当前时钟联动一次健康判定与告警对账（SLA/新鲜度告警随之收敛）。
-            long now = System.currentTimeMillis();
-            healthEvaluationService.assessAndReconcile(ev.getPipelineName(), now);
-        }
         return r;
     }
 
     private PipelineRunState converge(PipelineRunState s, PipelineEvent ev, ConvergenceOutcome out) {
-        long ingestAt = System.currentTimeMillis();
+        // 接入记账时刻同样走服务时钟：固定时钟验证时，告警触发/恢复与判定使用同一时间轴，
+        // 不会出现“告警挂在墙钟时刻、恢复指令被当成迟到”的残留。
+        long ingestAt = clock.nowMillis();
         if (s.getStatus() == null) {
             s.setFirstSeenTime(ingestAt);
         }

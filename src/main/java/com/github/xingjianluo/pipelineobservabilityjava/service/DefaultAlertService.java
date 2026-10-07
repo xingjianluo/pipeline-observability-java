@@ -50,12 +50,16 @@ public class DefaultAlertService implements AlertService {
         log.info("reconcile pipeline={} verdict={} alertType={} at={}",
                 assessment.getPipelineName(), assessment.getStatus(), type, atMillis);
         if (type == null) {
-            // 健康/抖动/从未成功：确保该管道所有健康类与失败类活跃告警被幂等恢复。
+            // 结论不需要挂健康类告警（HEALTHY / TRANSIENT_JITTER / NEVER_RAN）：
+            // 健康类告警（STALE/SCHEDULE_LAGGING/SLA_BREACHED）必须同口径幂等恢复，
+            // 保证“结论说正常（或无需告警）就绝不残留健康类告警”。
+            for (AlertType t : List.of(AlertType.STALE, AlertType.SCHEDULE_LAGGING,
+                    AlertType.SLA_BREACHED)) {
+                recover(assessment.getPipelineName(), t, atMillis);
+            }
             if (assessment.getStatus() == FreshnessStatus.HEALTHY) {
-                for (AlertType t : List.of(AlertType.STALE, AlertType.SCHEDULE_LAGGING,
-                        AlertType.SLA_BREACHED, AlertType.RUN_FAILED)) {
-                    recover(assessment.getPipelineName(), t, atMillis);
-                }
+                // 事件驱动的失败告警也随整体恢复健康一并关闭（失败后重跑成功的场景）。
+                recover(assessment.getPipelineName(), AlertType.RUN_FAILED, atMillis);
             }
             return null;
         }

@@ -40,4 +40,12 @@ public class ApiExceptionHandler {
     public ResponseEntity<Map<String, String>> illegalArg(IllegalArgumentException e) {
         return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
     }
+
+    /** 对账自洽校验失败等内部矛盾：显式 5xx，绝不把矛盾结果悄悄返回。 */
+    @ExceptionHandler(IllegalStateException.class)
+    public ResponseEntity<Map<String, String>> illegalState(IllegalStateException e) {
+        log.error("internal inconsistency surfaced: {}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+    }
 }

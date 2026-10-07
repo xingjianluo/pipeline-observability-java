@@ -45,10 +45,18 @@
 原文片段、拒绝时刻），管道名从原始报文中尽力提取，解析不出时归入 `<unknown>`。
 留痕与计数均为线程安全的原子累加，并发被拒不丢不重。
 
+**留痕容量上限（内存有界）**：留痕明细条数受 `observability.rejection-log-capacity`
+（默认 10000）限制，超出后按到达先后淘汰最旧明细（FIFO），服务长期运行内存只增到
+上限为止。淘汰只影响明细的可见范围：按管道、按原因的累计被拒条数（`total`/`byCode`）
+独立累加、只增不减，一条都不会少。明细被淘汰之后，按管道/按原因的明细查询返回
+当前保留窗口内的记录（可能为空），汇总查询照常精确可用；汇总响应同时携带
+`capacity`（容量上限）、`retainedRecords`（当前保留明细条数）、`evictedRecords`
+（累计被淘汰条数）便于自查。
+
 - `GET /api/observability/rejections?pipeline=<名>&code=<原因>`：按管道、按原因过滤
-  查询留痕明细（参数均可省略）。
+  查询当前保留的留痕明细（参数均可省略）。
 - `GET /api/observability/rejections/summary?pipeline=<名>`：每种原因各自累计被拒
-  条数（`byCode`）与总数（`total`）；省略 `pipeline` 时统计全局。
+  条数（`byCode`）与总数（`total`，含已被淘汰的明细）；省略 `pipeline` 时统计全局。
 
 ## 2. 运行状态收敛规则
 
@@ -112,6 +120,13 @@ RUN_FAILED`；级别 `WARNING → CRITICAL`；状态 `FIRING / SUPPRESSED / RECO
 - **恢复**：健康判定回到 HEALTHY（或显式调用恢复接口）时告警转为 RECOVERED，
   从活跃列表移除并记入历史（`?includeRecovered=true` 可查），恰好一条 RECOVERY 通知；
   重复恢复为空操作，不重复通知。
+- **结论与告警同口径（不强依赖 HEALTHY）**：每次健康评估联动对账时，只要结论
+  不需要挂健康类告警（HEALTHY / TRANSIENT_JITTER / NEVER_RAN），该管道的
+  STALE / SCHEDULE_LAGGING / SLA_BREACHED 活跃告警就被幂等恢复——说正常就绝不
+  残留告警；HEALTHY 时 RUN_FAILED 也一并关闭。上报联动、主动查询、对账三条路径
+  使用**同一个服务时钟**（`SystemClock`，测试可固定/拨动），同一时刻对同一管道
+  给出的结论与告警状态必然一致：告警的触发/恢复时间戳取自服务时钟，固定时钟
+  验证时不会出现“告警挂在墙钟时刻、恢复指令被当成迟到而忽略”的残留。
 - **维护窗口**：窗口内触发的告警置为 SUPPRESSED，计数照常合并（`suppressedCount`）但
   **不发送任何通知**，记录仍可追溯；窗口结束后若仍异常，沿同一条告警补发一次 FIRING。
   窗口可限定管道或全局（pipelineName 省略为全局），时间区间闭区间。
@@ -149,6 +164,16 @@ RUN_FAILED`；级别 `WARNING → CRITICAL`；状态 `FIRING / SUPPRESSED / RECO
   `rejectedEvents` 与 `rejectionsByCode`（被拒总数及分原因计数）、
   `alertMergedCount`（告警合并计数）、`runsTracked`。
   所有计数在并发/乱序/重复下原子累加，精确不丢不重。
+- `consistent` 与 `consistencyBasis`：这份对账是否自洽及其判断依据。
+
+**一致快照与自洽保证**：整个“评估 + 告警对账 + 计数快照”在与上报联动共用的
+同一把互斥锁内完成——上报与对账并发时，对账看到的永远是“事件已应用且告警已
+同口径联动”的完整状态，不会拼出矛盾组合。返回前逐项校验并写入
+`consistencyBasis`：① 快照时刻一致（`health.evaluatedAt == evaluatedAt`）；
+② 计数恒等式（`received == applied + duplicate + late`）；③ 健康结论与活跃
+告警互相印证（异常结论必有对应告警在挂，无需告警的结论不得残留健康类告警）。
+全部通过时 `consistent=true`；任一不满足则接口直接返回 5xx 错误，
+**绝不把自相矛盾的对账结果悄悄返回**。
 
 ## 6. 可配置项（`src/main/resources/application.properties`）
 
@@ -162,12 +187,13 @@ RUN_FAILED`；级别 `WARNING → CRITICAL`；状态 `FIRING / SUPPRESSED / RECO
 | `observability.default-schedule-grace-ms` | 120000 | 调度滞后宽限 |
 | `observability.escalation-after-ms` | 1800000 | 告警升级时长 |
 | `observability.critical-missed-runs` | 2 | 连续错过多少轮调度即视为严重（告警直接 CRITICAL） |
+| `observability.rejection-log-capacity` | 10000 | 拒绝留痕明细容量上限，超出按到达先后淘汰最旧；累计计数不受影响 |
 | `observability.pipelines.<name>.*` | - | 按管道覆盖以上阈值（如 `schedule-interval-ms`、`freshness-threshold-ms`） |
 
 ## 7. 验证方法
 
 ```bash
-mvn test                 # 全部 31 个单测/集成测试
+mvn test                 # 全部 34 个单测/集成测试
 mvn spring-boot:run      # 启动服务，默认 8080 端口
 ```
 
@@ -189,6 +215,15 @@ mvn spring-boot:run      # 启动服务，默认 8080 端口
   维护窗口抑制与窗口后补发；
 - `ReconciliationConsistencyTest`：对账视图的健康结论与告警状态同口径
   （STALE 时告警在挂、恢复后无残留），计数与实际上报逐条对得上；
+- `FixedClockAlertRecoveryTest`：固定服务时间下，上报联动/查询/对账三条路径
+  结论一致，告警按服务时钟触发与恢复——恢复当场生效、历史可查、
+  RECOVERY 通知恰好一条、重复恢复不重复通知；
+- `ConcurrentReconciliationConsistencyTest`：固定时钟下 8 线程上报风暴与
+  2 线程对账并发交错，每份对账快照均满足 `consistent=true`、计数恒等式、
+  健康/告警同口径、评估时刻等于固定时钟；
+- `RejectionLogCapacityTest`：留痕容量上限为 5 时打 14 条被拒，明细按 FIFO
+  淘汰最旧（保留窗口恒为 5、`evictedRecords` 精确），按管道/按原因累计计数
+  一条不少，淘汰后明细查询与汇总查询照常可用；
 - `WebApiIntegrationTest`：HTTP 端到端、畸形 JSON 结构化拒绝（MALFORMED_JSON）、
   拒绝留痕查询/汇总接口、对账接口。
 
@@ -207,6 +242,21 @@ curl -s -XPOST localhost:8080/api/observability/events -H 'Content-Type: applica
 curl -s 'localhost:8080/api/observability/rejections?pipeline=etl'
 curl -s 'localhost:8080/api/observability/rejections/summary?pipeline=etl'
 
-# 查看单管道对账（健康结论 + 告警 + 计数，同一口径）
+# 查看单管道对账（健康结论 + 告警 + 计数，同一口径；
+# consistent=true 且 consistencyBasis 给出自洽判断依据）
 curl -s localhost:8080/api/observability/pipelines/etl/reconciliation
+
+# 留痕容量自查：capacity / retainedRecords / evictedRecords 与精确累计计数
+curl -s 'localhost:8080/api/observability/rejections/summary'
+```
+
+本地验证三类场景的快捷方式：
+
+```bash
+# 1) 固定时钟下的告警恢复与结论一致
+mvn test -Dtest=FixedClockAlertRecoveryTest
+# 2) 上报与对账并发时的快照自洽
+mvn test -Dtest=ConcurrentReconciliationConsistencyTest
+# 3) 留痕超容量后的淘汰与计数精确（测试内已把容量覆盖为 5 复现淘汰）
+mvn test -Dtest=RejectionLogCapacityTest
 ```
