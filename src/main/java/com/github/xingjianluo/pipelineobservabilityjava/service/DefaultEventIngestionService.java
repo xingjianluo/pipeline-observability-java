@@ -12,6 +12,7 @@ import com.github.xingjianluo.pipelineobservabilityjava.model.PipelineRunState;
 import com.github.xingjianluo.pipelineobservabilityjava.model.RejectCode;
 import com.github.xingjianluo.pipelineobservabilityjava.model.RunStatus;
 import com.github.xingjianluo.pipelineobservabilityjava.store.RunStateStore;
+import com.github.xingjianluo.pipelineobservabilityjava.time.SystemClock;
 
 @Service
 public class DefaultEventIngestionService implements EventIngestionService {
@@ -23,17 +24,23 @@ public class DefaultEventIngestionService implements EventIngestionService {
     private final AlertService alertService;
     private final HealthEvaluationService healthEvaluationService;
     private final RejectionLogService rejectionLog;
+    private final SystemClock clock;
+    private final ConsistencyGuard consistencyGuard;
 
     public DefaultEventIngestionService(RunStateStore store,
                                         ObservabilityProperties properties,
                                         AlertService alertService,
                                         HealthEvaluationService healthEvaluationService,
-                                        RejectionLogService rejectionLog) {
+                                        RejectionLogService rejectionLog,
+                                        SystemClock clock,
+                                        ConsistencyGuard consistencyGuard) {
         this.store = store;
         this.properties = properties;
         this.alertService = alertService;
         this.healthEvaluationService = healthEvaluationService;
         this.rejectionLog = rejectionLog;
+        this.clock = clock;
+        this.consistencyGuard = consistencyGuard;
     }
 
     @Override
@@ -51,10 +58,20 @@ public class DefaultEventIngestionService implements EventIngestionService {
             return IngestResult.rejected(e.getCode(), e.getMessage());
         }
 
-        // 2) 在按 runId 串行化的临界区内完成状态机收敛，保证乱序/并发结论一致。
+        // 2) 在一致性守卫内完成“按 runId 串行收敛 + 联动健康评估/告警对账”：
+        //    与按管道对账互斥，对账拿到的健康结论、告警与计数必是同一时刻的快照。
+        //    时钟统一走 SystemClock：否则两套时间口径会让联动结论与查询结论对不上，
+        //    且固定时钟下恢复指令会被“迟到保护”误吞、告警恢复不掉。
         final PipelineEvent ev = event;
         ConvergenceOutcome outcome = new ConvergenceOutcome();
-        PipelineRunState state = store.compute(ev.getRunId(), s -> converge(s, ev, outcome));
+        PipelineRunState state = consistencyGuard.atomically(() -> {
+            PipelineRunState st = store.compute(ev.getRunId(), s -> converge(s, ev, outcome));
+            if (!outcome.duplicate && !outcome.lateIgnored) {
+                // 事件真正推进状态后，按服务时钟联动一次健康判定与告警对账。
+                healthEvaluationService.assessAndReconcile(ev.getPipelineName(), clock.nowMillis());
+            }
+            return st;
+        });
 
         IngestResult r = new IngestResult();
         r.setRunId(ev.getRunId());
@@ -72,16 +89,12 @@ public class DefaultEventIngestionService implements EventIngestionService {
         }
         log.info("converged runId={} status={} version={} duplicate={} reason={}",
                 ev.getRunId(), state.getStatus(), state.getVersion(), outcome.duplicate, outcome.reason);
-        if (!outcome.duplicate && !outcome.lateIgnored) {
-            // 事件真正推进状态后，按当前时钟联动一次健康判定与告警对账（SLA/新鲜度告警随之收敛）。
-            long now = System.currentTimeMillis();
-            healthEvaluationService.assessAndReconcile(ev.getPipelineName(), now);
-        }
         return r;
     }
 
     private PipelineRunState converge(PipelineRunState s, PipelineEvent ev, ConvergenceOutcome out) {
-        long ingestAt = System.currentTimeMillis();
+        // 接入记账时刻同样走服务时钟，保证 transitionLog / firstSeen / 告警联动时间同一口径。
+        long ingestAt = clock.nowMillis();
         if (s.getStatus() == null) {
             s.setFirstSeenTime(ingestAt);
         }

@@ -30,6 +30,10 @@ public final class PipelineReconciliation {
     private long alertMergedCount;
     /** 该管道当前跟踪的运行实例数。 */
     private long runsTracked;
+    /** 本份对账是否自洽：健康结论、告警状态与各类计数取自同一时刻的一致快照且通过自洽校验。 */
+    private boolean consistent;
+    /** 自洽判断依据（逐条列出校验项与结论），便于核账时自证。 */
+    private List<String> consistencyNotes = List.of();
 
     public String getPipelineName() { return pipelineName; }
     public void setPipelineName(String pipelineName) { this.pipelineName = pipelineName; }
@@ -55,4 +59,8 @@ public final class PipelineReconciliation {
     public void setAlertMergedCount(long alertMergedCount) { this.alertMergedCount = alertMergedCount; }
     public long getRunsTracked() { return runsTracked; }
     public void setRunsTracked(long runsTracked) { this.runsTracked = runsTracked; }
+    public boolean isConsistent() { return consistent; }
+    public void setConsistent(boolean consistent) { this.consistent = consistent; }
+    public List<String> getConsistencyNotes() { return consistencyNotes; }
+    public void setConsistencyNotes(List<String> consistencyNotes) { this.consistencyNotes = consistencyNotes; }
 }

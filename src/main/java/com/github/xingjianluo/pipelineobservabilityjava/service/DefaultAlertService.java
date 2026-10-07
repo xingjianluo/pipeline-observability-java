@@ -44,19 +44,29 @@ public class DefaultAlertService implements AlertService {
         return pipeline + "|" + type.name();
     }
 
+    /** 由健康结论驱动的三类告警：结论与告警严格同口径，结论不含哪类就当场恢复哪类。 */
+    private static final List<AlertType> HEALTH_DRIVEN_TYPES =
+            List.of(AlertType.STALE, AlertType.SCHEDULE_LAGGING, AlertType.SLA_BREACHED);
+
     @Override
     public Alert reconcile(HealthAssessment assessment, long atMillis) {
         AlertType type = map(assessment.getStatus());
         log.info("reconcile pipeline={} verdict={} alertType={} at={}",
                 assessment.getPipelineName(), assessment.getStatus(), type, atMillis);
-        if (type == null) {
-            // 健康/抖动/从未成功：确保该管道所有健康类与失败类活跃告警被幂等恢复。
-            if (assessment.getStatus() == FreshnessStatus.HEALTHY) {
-                for (AlertType t : List.of(AlertType.STALE, AlertType.SCHEDULE_LAGGING,
-                        AlertType.SLA_BREACHED, AlertType.RUN_FAILED)) {
-                    recover(assessment.getPipelineName(), t, atMillis);
-                }
+        // 同口径恢复：健康结论不产生某类健康告警（HEALTHY/TRANSIENT_JITTER/NEVER_RAN，
+        // 或结论已从一类切换到另一类，如 SCHEDULE_LAGGING -> STALE）时，
+        // 该类活跃告警必须当场幂等恢复，不允许“结论已正常但告警残留”。
+        for (AlertType t : HEALTH_DRIVEN_TYPES) {
+            if (t != type) {
+                recover(assessment.getPipelineName(), t, atMillis);
             }
+        }
+        if (assessment.getStatus() == FreshnessStatus.HEALTHY) {
+            // 完全恢复健康时，失败类告警也一并幂等关闭（失败本身由 SUCCESS 事件即时关闭，
+            // 这里兜底保证“说正常就不挂任何告警”）。
+            recover(assessment.getPipelineName(), AlertType.RUN_FAILED, atMillis);
+        }
+        if (type == null) {
             return null;
         }
         return merge(assessment.getPipelineName(), type, atMillis,

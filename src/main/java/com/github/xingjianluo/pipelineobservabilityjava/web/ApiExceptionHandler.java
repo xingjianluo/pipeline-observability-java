@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import com.github.xingjianluo.pipelineobservabilityjava.model.IngestResult;
 import com.github.xingjianluo.pipelineobservabilityjava.model.RejectCode;
+import com.github.xingjianluo.pipelineobservabilityjava.service.DefaultReconciliationService;
 import com.github.xingjianluo.pipelineobservabilityjava.service.RejectionLogService;
 
 /** 统一把接入层错误转成带 rejectCode 的响应，任何坏事件都不静默。 */
@@ -39,5 +40,15 @@ public class ApiExceptionHandler {
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, String>> illegalArg(IllegalArgumentException e) {
         return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+    }
+
+    /** 对账自洽校验持续失败：明确返回 409 与矛盾点，绝不悄悄返回矛盾结果。 */
+    @ExceptionHandler(DefaultReconciliationService.ReconciliationInconsistentException.class)
+    public ResponseEntity<Map<String, Object>> inconsistent(
+            DefaultReconciliationService.ReconciliationInconsistentException e) {
+        log.error("reconciliation inconsistent: {}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(Map.of("error", "reconciliation not self-consistent",
+                        "violations", e.getViolations()));
     }
 }

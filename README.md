@@ -45,10 +45,18 @@
 原文片段、拒绝时刻），管道名从原始报文中尽力提取，解析不出时归入 `<unknown>`。
 留痕与计数均为线程安全的原子累加，并发被拒不丢不重。
 
+**留痕容量上限（明细有界、计数精确）**：留痕明细保存在容量上限为
+`observability.rejection-log-capacity`（默认 10000 条）的有界队列中，超出后按到达
+先后淘汰最旧明细（FIFO），内存不随接入方与拒绝量无限增长。按管道、按原因的累计
+被拒条数与明细存储解耦、只增不减——明细被淘汰后计数一条不少、始终精确；
+按管道/原因的明细查询照常可用（返回仍保留的明细），汇总查询始终反映全量累计。
+
 - `GET /api/observability/rejections?pipeline=<名>&code=<原因>`：按管道、按原因过滤
-  查询留痕明细（参数均可省略）。
+  查询留痕明细（参数均可省略；仅返回容量内仍保留的明细）。
 - `GET /api/observability/rejections/summary?pipeline=<名>`：每种原因各自累计被拒
-  条数（`byCode`）与总数（`total`）；省略 `pipeline` 时统计全局。
+  条数（`byCode`）与总数（`total`，全量累计、不受淘汰影响）；省略 `pipeline`
+  时统计全局。响应另带 `retained`（当前保留明细条数）与 `capacity`（容量上限），
+  用于核对淘汰语义。
 
 ## 2. 运行状态收敛规则
 
@@ -117,6 +125,23 @@ RUN_FAILED`；级别 `WARNING → CRITICAL`；状态 `FIRING / SUPPRESSED / RECO
   窗口可限定管道或全局（pipelineName 省略为全局），时间区间闭区间。
 - 迟到保护：`atMillis` 早于已处理时间的观测/恢复指令一律忽略，旧消息不能覆盖新状态。
 
+### 结论与告警同口径的保证
+
+无论结论由上报联动算出、还是由查询/对账触发，同一时刻对同一管道的健康结论与
+告警状态都一致，且恢复不留残留、不重复通知：
+
+- **统一服务时钟**：上报接入、联动评估、告警触发/恢复与查询/对账全部使用同一个
+  可替换的 `SystemClock`，不存在“联动用墙钟、查询用另一套时间”的双口径；
+  本地把服务时间固定下来验证时，各路径结论必然相同，恢复指令也不会被
+  “迟到保护”误吞（这正是之前告警恢复不掉的根因）。
+- **结论不含即恢复**：每次健康评估联动告警对账时，结论不产生哪类健康告警
+  （STALE / SCHEDULE_LAGGING / SLA_BREACHED），哪类活跃告警就当场幂等恢复；
+  结论为 HEALTHY 时连 RUN_FAILED 也一并关闭。因此“说正常就不挂任何告警”，
+  结论在告警类型之间切换（如 SCHEDULE_LAGGING → STALE）也不会残留旧类型告警。
+- **恢复可追溯**：恢复的告警从活跃列表移除并记入历史
+  （`GET /api/observability/alerts?includeRecovered=true` 可查 RECOVERED 记录），
+  此前真正对外通知过的告警恢复时发恰好一条 RECOVERY 通知；重复恢复是空操作。
+
 通知出口为进程内 `InMemoryNotificationSink`，记录 FIRING / ESCALATION / RECOVERY 三类通知。
 
 ## 5. HTTP 接口
@@ -136,19 +161,31 @@ RUN_FAILED`；级别 `WARNING → CRITICAL`；状态 `FIRING / SUPPRESSED / RECO
 | GET  | `/api/observability/pipelines/{pipeline}/reconciliation` | 单管道运行质量与告警对账 |
 | GET  | `/api/observability/snapshot` | 健康+告警+维护窗口总览 |
 
-### 对账接口（结论与计数同一口径）
+### 对账接口（同一时刻的一致快照，结果可自证自洽）
 
 `GET /api/observability/pipelines/{pipeline}/reconciliation` 返回：
 
 - `health`：当前健康结论（含判定依据 `reasons` 与调度推算字段）；
-- `activeAlerts`：对账后的活跃告警——先在 `evaluatedAt` 时刻完成健康评估与告警
-  对账再取快照，因此健康结论与告警状态**同一口径、互不矛盾**
+- `activeAlerts`：对账后的活跃告警——与健康结论同一时刻、同一口径
   （HEALTHY 时活跃告警必为空；异常时对应告警必在挂）；
 - 计数：`receivedEvents`（接收总数）、`duplicateEvents`（精确重复）、
   `lateEvents`（迟到忽略）、`appliedEvents`（= received − duplicate − late）、
   `rejectedEvents` 与 `rejectionsByCode`（被拒总数及分原因计数）、
   `alertMergedCount`（告警合并计数）、`runsTracked`。
   所有计数在并发/乱序/重复下原子累加，精确不丢不重。
+- `consistent` 与 `consistencyNotes`：**自洽声明及其判断依据**。
+
+**一致快照如何保证**：上报的“状态收敛 + 联动健康评估/告警对账”与按管道对账在
+同一把一致性守卫（`ConsistencyGuard`）内互斥执行，因此一次对账里的健康结论、
+告警状态与各类计数都来自同一时刻的快照——上报与对账并发打进来时，也不会拿到
+结论与告警互相矛盾的组合。
+
+**`consistent=true` 的含义**：返回前对快照逐项校验并全部通过，依据逐条写入
+`consistencyNotes`：计数勾稽（`applied = received − duplicate − late`）、
+被拒汇总勾稽（`rejectedEvents = Σ rejectionsByCode`）、健康结论与活跃告警同口径
+（结论产生的告警类型必在挂、不产生的必不在挂；HEALTHY 时活跃告警为空）。
+若校验发现矛盾，服务会重取一次快照再校验；仍矛盾则返回 **409 CONFLICT**
+（响应体含矛盾点 `violations`），绝不把矛盾结果悄悄返回。
 
 ## 6. 可配置项（`src/main/resources/application.properties`）
 
@@ -162,12 +199,13 @@ RUN_FAILED`；级别 `WARNING → CRITICAL`；状态 `FIRING / SUPPRESSED / RECO
 | `observability.default-schedule-grace-ms` | 120000 | 调度滞后宽限 |
 | `observability.escalation-after-ms` | 1800000 | 告警升级时长 |
 | `observability.critical-missed-runs` | 2 | 连续错过多少轮调度即视为严重（告警直接 CRITICAL） |
+| `observability.rejection-log-capacity` | 10000 | 被拒留痕明细容量上限（条），超出按到达先后淘汰最旧；累计计数不受影响 |
 | `observability.pipelines.<name>.*` | - | 按管道覆盖以上阈值（如 `schedule-interval-ms`、`freshness-threshold-ms`） |
 
 ## 7. 验证方法
 
 ```bash
-mvn test                 # 全部 31 个单测/集成测试
+mvn test                 # 全部 36 个单测/集成测试
 mvn spring-boot:run      # 启动服务，默认 8080 端口
 ```
 
@@ -189,6 +227,15 @@ mvn spring-boot:run      # 启动服务，默认 8080 端口
   维护窗口抑制与窗口后补发；
 - `ReconciliationConsistencyTest`：对账视图的健康结论与告警状态同口径
   （STALE 时告警在挂、恢复后无残留），计数与实际上报逐条对得上；
+- `AlertRecoveryConsistencyTest`：固定服务时间下，上报联动/主动查询/对账三条路径
+  结论一致；恢复正常后告警当场恢复（活跃无残留、历史有 RECOVERED、通知恰好一次、
+  重复恢复空操作）；TRANSIENT_JITTER 结论同样清除已挂健康类告警；
+- `ReconciliationSnapshotConsistencyTest`：4 写线程 + 3 读线程并发打满，
+  480 份并发对账快照逐份校验自洽（consistent、计数勾稽、结论与告警同口径），
+  终态计数精确；
+- `RejectionLogCapacityTest`：留痕超容量后最旧明细按 FIFO 淘汰、保留明细有序，
+  按管道/原因累计计数一条不少，淘汰后明细查询与汇总查询照常可用；
+  8 线程 × 500 并发被拒下容量与计数同时成立；
 - `WebApiIntegrationTest`：HTTP 端到端、畸形 JSON 结构化拒绝（MALFORMED_JSON）、
   拒绝留痕查询/汇总接口、对账接口。
 
@@ -207,6 +254,17 @@ curl -s -XPOST localhost:8080/api/observability/events -H 'Content-Type: applica
 curl -s 'localhost:8080/api/observability/rejections?pipeline=etl'
 curl -s 'localhost:8080/api/observability/rejections/summary?pipeline=etl'
 
-# 查看单管道对账（健康结论 + 告警 + 计数，同一口径）
+# 查看单管道对账（健康结论 + 告警 + 计数，同一时刻一致快照，含 consistent/consistencyNotes）
 curl -s localhost:8080/api/observability/pipelines/etl/reconciliation
+
+# 留痕容量：把 observability.rejection-log-capacity 调小（如 10）重启，
+# 连续触发若干次被拒上报后观察——明细只保留最新 10 条，summary 的 total/byCode 仍是全量累计
+curl -s 'localhost:8080/api/observability/rejections/summary'   # 含 retained 与 capacity
 ```
+
+本地验证“结论与告警同口径 / 恢复不掉”场景：测试时钟固定（`MutableClock`）时，
+上报联动、主动查询与对账走同一时钟，管道补跑成功后告警当场恢复；
+对应自动化用例见 `AlertRecoveryConsistencyTest`。并发“上报 + 对账”下快照自洽
+见 `ReconciliationSnapshotConsistencyTest`，留痕淘汰与计数精确见
+`RejectionLogCapacityTest`，均可通过 `mvn test` 复现，日志中带
+`[INPUT]/[RESULT]/[ASSERT]` 等输入与判定依据。

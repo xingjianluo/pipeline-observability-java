@@ -106,14 +106,16 @@ public class ObservabilityController {
                 pipeline == null || pipeline.isBlank() ? null : pipeline, rejectCode);
     }
 
-    /** 每种拒绝原因各自累计被拒条数（可按管道过滤）。 */
+    /** 每种拒绝原因各自累计被拒条数（可按管道过滤）；retained/capacity 表明细淘汰语义。 */
     @GetMapping("/rejections/summary")
     public Map<String, Object> rejectionSummary(@RequestParam(required = false) String pipeline) {
         String p = pipeline == null || pipeline.isBlank() ? null : pipeline;
         return Map.of(
                 "pipeline", p == null ? "*" : p,
                 "total", rejections.totalCount(p),
-                "byCode", rejections.countByCode(p));
+                "byCode", rejections.countByCode(p),
+                "retained", rejections.retainedCount(),
+                "capacity", rejections.capacity());
     }
 
     @PostMapping("/alerts/{pipeline}/{type}/recover")

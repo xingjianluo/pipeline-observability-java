@@ -20,4 +20,10 @@ public interface RejectionLogService {
 
     /** 某管道累计被拒总条数；pipelineName 为 null 时返回全局总数。 */
     long totalCount(String pipelineName);
+
+    /** 当前仍保留在内存中的留痕明细条数（受容量上限约束，可能小于累计总数）。 */
+    long retainedCount();
+
+    /** 留痕明细容量上限（条）。 */
+    int capacity();
 }
